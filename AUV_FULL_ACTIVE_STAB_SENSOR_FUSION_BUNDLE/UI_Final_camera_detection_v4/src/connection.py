@@ -1,0 +1,1818 @@
+import time
+import math
+import random
+import queue
+import threading
+from PySide6.QtCore import QThread, Signal
+from src.crypto_link import SecureLink
+
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """
+    Computes the geodesic distance in meters between two GPS coordinates using the Haversine formula.
+    """
+    R = 6371000.0  # Earth's radius in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    d_phi = math.radians(lat2 - lat1)
+    d_lambda = math.radians(lon2 - lon1)
+    
+    a = math.sin(d_phi / 2.0)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2.0)**2
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+    return R * c
+
+class MarineTelemetryThread(QThread):
+    # Signals
+    # data_received emits a dictionary of telemetry values
+    data_received = Signal(dict)
+    connection_status = Signal(bool, str)
+    wp_ack_received = Signal()
+    stabilization_status_received = Signal(bool, str)
+    fusion_status_received = Signal(dict)
+    log_received = Signal(str)
+    raw_line_received = Signal(str)
+
+    def __init__(self, port, baudrate):
+        super().__init__()
+        self.port = port
+        # In socket mode, baudrate contains the IP:Port string (e.g. "127.0.0.1:8888" or "8888")
+        self.raw_target = str(baudrate)
+        self.baudrate = 9600
+        try:
+            if port not in ("TCP CLIENT", "UDP CLIENT"):
+                self.baudrate = int(baudrate)
+        except Exception:
+            pass
+            
+        self.running = False
+        self.mission_active = False
+        self.rth_active = False
+        self.home_lat = None
+        self.home_lon = None
+        self.sim_pwm_rc1 = 1500
+        self.sim_pwm_rc2 = 1500
+        self.sim_pwm_rc3 = 1500
+        self.target_waypoints = []
+        self.current_wp_index = 0
+        self.secure_link = SecureLink()
+        self.use_security = False
+        
+        # Socket descriptors
+        self.socket_conn = None
+        self.udp_send_addr = None
+        self.light_state = 0
+        self.camera_state = 0
+        self.sim_sonar_active = False
+        self.sim_wp_tolerance = 1.0
+        self.stabilization_active = False
+        self.sim_active_stabilization = False
+        self.sim_is_armed = False
+        self.sim_stab_hold_lat = None
+        self.sim_stab_hold_lon = None
+        self.sim_stab_hold_heading = None
+        self.fusion_backend_state = {
+            "connected": False, "valid": False, "range_m": None,
+            "bearing_rel_deg": None, "sigma_m": None, "sources": "",
+            "stage": "NO_FIX", "age_s": None, "timestamp": 0.0, "error": ""
+        }
+
+        # GUI-safe outbound command queue.  write_data() is called by Qt widgets
+        # in the main thread; it must never block on socket.sendall() or a serial
+        # flush.  The QThread run loop owns the physical transport and drains this
+        # queue.  A bounded queue prevents an unhealthy link from consuming RAM.
+        self._tx_queue = queue.Queue(maxsize=128)
+        self._tx_drop_count = 0
+        self._manual_tx_lock = threading.Lock()
+        self._pending_manual_packet = None
+        self._pending_fusion_packet = None
+
+    def _handle_special_line(self, line):
+        """Handle non-telemetry control replies common to serial/TCP/UDP."""
+        normalized = line.lstrip("$")
+        upper = normalized.upper()
+        if upper.startswith("ACK,WP"):
+            self.wp_ack_received.emit()
+            return True
+        if upper.startswith("LOG,"):
+            parts = normalized.split("LOG,", 1)
+            self.log_received.emit(parts[1] if len(parts) > 1 else "")
+            return True
+        if upper.startswith("ACK,STABILIZE,"):
+            parts = normalized.split(",")
+            enabled = len(parts) > 2 and parts[2].strip().upper() == "ON"
+            mode = parts[3].strip() if len(parts) > 3 and parts[3].strip() else ("ON" if enabled else "OFF")
+            self.stabilization_active = enabled
+            self.stabilization_status_received.emit(enabled, mode)
+            return True
+        if upper.startswith("ACK,FUSE,"):
+            parts = normalized.split(",")
+            try:
+                valid = len(parts) > 2 and int(float(parts[2] or 0)) == 1
+            except (TypeError, ValueError):
+                valid = False
+
+            def _maybe_float(index):
+                if index >= len(parts) or parts[index].strip() == "":
+                    return None
+                try:
+                    return float(parts[index])
+                except (TypeError, ValueError):
+                    return None
+
+            age = None
+            for item in parts[8:]:
+                if item.upper().startswith("AGE="):
+                    try:
+                        age = float(item.split("=", 1)[1])
+                    except (TypeError, ValueError):
+                        age = None
+            state = {
+                "connected": True,
+                "valid": valid,
+                "range_m": _maybe_float(3),
+                "bearing_rel_deg": _maybe_float(4),
+                "sigma_m": _maybe_float(5),
+                "sources": parts[6].strip() if len(parts) > 6 else "",
+                "stage": parts[7].strip() if len(parts) > 7 and parts[7].strip() else "NO_FIX",
+                "age_s": age,
+                "timestamp": time.monotonic(),
+                "error": "",
+            }
+            self.fusion_backend_state = state
+            self.fusion_status_received.emit(dict(state))
+            return True
+        if upper.startswith("ERR,FUSE,"):
+            state = dict(self.fusion_backend_state)
+            state.update(connected=True, timestamp=time.monotonic(),
+                         error=normalized.split(",", 2)[2] if normalized.count(",") >= 2 else "FUSE_ERROR")
+            self.fusion_backend_state = state
+            self.fusion_status_received.emit(dict(state))
+            return True
+        return False
+
+    def set_waypoints(self, wps):
+        self.target_waypoints = wps
+        self.current_wp_index = 0
+        
+    def start_mission(self):
+        self.mission_active = True
+        self.current_wp_index = 0
+        
+    def stop_mission(self):
+        self.mission_active = False
+
+    @staticmethod
+    def get_available_ports():
+        usb_ports = []
+        other_ports = []
+        if SERIAL_AVAILABLE:
+            system_ports = serial.tools.list_ports.comports()
+            for p in system_ports:
+                desc = (p.description or "").lower()
+                # Prioritize USB to UART / CP210x / FTDI / CH340 / Teensy / Arduino ports over Bluetooth
+                if any(x in desc for x in ("usb", "cp210", "ftdi", "ch340", "uart", "serial port", "teensy", "arduino")):
+                    usb_ports.append(p.device)
+                else:
+                    other_ports.append(p.device)
+        ports = usb_ports + other_ports
+        # Always include network & simulator options
+        ports.append("UDP CLIENT")
+        ports.append("TCP CLIENT")
+        ports.append("SIMULATOR")
+        return ports
+
+    def run(self):
+        self.running = True
+        
+        if self.port == "SIMULATOR":
+            self.run_simulation()
+        elif self.port == "TCP CLIENT":
+            self.run_tcp_client()
+        elif self.port == "UDP CLIENT":
+            self.run_udp_client()
+        else:
+            self.run_serial()
+
+    def run_simulation(self):
+        self.connection_status.emit(True, "Simulator Active")
+        
+        # Demo location: keep the connected telemetry display near this site.
+        base_lat = 12.9475016
+        base_lon = 80.2121516
+        lat = base_lat
+        lon = base_lon
+        heading = 45.0  # Yaw degrees
+        
+        self.home_lat = lat
+        self.home_lon = lon
+        self.rth_active = False
+
+        step = 0
+        while self.running:
+            # Simulate marine vessel dynamics
+            # Roll (rocking left-right): sine wave + random swell noise
+            roll = 5.0 * math.sin(step * 0.05) + random.uniform(-0.5, 0.5)
+            # Pitch (rocking front-back): shifted cosine wave + swell noise
+            pitch = 3.0 * math.cos(step * 0.03 + 0.5) + random.uniform(-0.3, 0.3)
+            
+            # Default thruster states
+            pwm_rc1 = 1500
+            pwm_rc2 = 1500
+            pwm_rc3 = 1500
+
+            # Target waypoint logic
+            target_lat, target_lon = None, None
+            if getattr(self, 'rth_active', False):
+                target_lat = self.home_lat
+                target_lon = self.home_lon
+            elif self.mission_active and self.target_waypoints and self.current_wp_index < len(self.target_waypoints):
+                target_lat, target_lon = self.target_waypoints[self.current_wp_index]
+
+            if target_lat is not None and target_lon is not None:
+                dist_m = haversine_distance(lat, lon, target_lat, target_lon)
+                
+                if dist_m < self.sim_wp_tolerance:  # Match UI/backend waypoint tolerance
+                    if getattr(self, 'rth_active', False):
+                        self.rth_active = False
+                        self.mission_active = False
+                        print("[SIMULATOR] Reached Home position!")
+                    else:
+                        self.current_wp_index += 1
+                        print(f"[SIMULATOR] Reached Waypoint {self.current_wp_index - 1}")
+                    
+                # Re-evaluate targets after potential index increments
+                target_lat, target_lon = None, None
+                if getattr(self, 'rth_active', False):
+                    target_lat = self.home_lat
+                    target_lon = self.home_lon
+                elif self.mission_active and self.target_waypoints and self.current_wp_index < len(self.target_waypoints):
+                    target_lat, target_lon = self.target_waypoints[self.current_wp_index]
+
+                if target_lat is not None and target_lon is not None:
+                    dist_m = haversine_distance(lat, lon, target_lat, target_lon)
+                    
+                    if dist_m > 0:
+                        target_heading = geodesic_bearing(lat, lon, target_lat, target_lon)
+                        heading_error = (target_heading - heading + 180) % 360 - 180
+                        
+                        abs_error = abs(heading_error)
+                        
+                        # 1. Advanced steering logic with turn-in-place and speed scaling
+                        if abs_error > 30.0:
+                            # Large heading error: Rotate in place
+                            pwm_rc1 = 1500
+                            pwm_rc2 = 1700 if heading_error > 0 else 1300
+                            turn_rate = 4.0  # rotate faster in place (deg per step)
+                            speed_m_s = 0.0
+                        elif 10.0 <= abs_error <= 30.0:
+                            # Medium error: Move slowly while steering
+                            pwm_rc1 = 1580
+                            pwm_rc2 = 1600 if heading_error > 0 else 1400
+                            turn_rate = 2.0
+                            speed_m_s = 0.5  # approx 1 knot
+                        else:
+                            # Small error (<10°): Go straight, scale speed based on distance
+                            pwm_rc2 = 1500
+                            turn_rate = 1.0
+                            if dist_m > 20.0:
+                                pwm_rc1 = 1700
+                                speed_m_s = 2.0  # full speed (approx 4 knots)
+                            elif dist_m >= 5.0:
+                                pwm_rc1 = 1600
+                                speed_m_s = 1.2  # medium approach speed
+                            else:
+                                pwm_rc1 = 1550
+                                speed_m_s = 0.6  # slow dock approach speed
+                        
+                        # T3 remains strictly deactivated (1500)
+                        pwm_rc3 = 1500
+                        
+                        # Simulate heading changes
+                        if abs_error > turn_rate:
+                            heading = (heading + turn_rate * (1.0 if heading_error > 0 else -1.0)) % 360.0
+                        else:
+                            heading = target_heading
+                        
+                        # Project movement coordinates along current heading vector (physically realistic)
+                        # Simulator updates at 10Hz, so time step is 0.1s
+                        step_dist = speed_m_s * 0.1
+                        
+                        # Convert meters step to latitude and longitude delta
+                        # 1 degree of latitude is approx 111,000 meters
+                        delta_lat = (step_dist * math.cos(math.radians(heading))) / 111000.0
+                        # 1 degree of longitude is approx 111,000 * cos(lat) meters
+                        delta_lon = (step_dist * math.sin(math.radians(heading))) / (111000.0 * math.cos(math.radians(lat)))
+                        
+                        lat += delta_lat
+                        lon += delta_lon
+                else:
+                    self.mission_active = False  # Completed route!
+                    self.rth_active = False
+            else:
+                if getattr(self, 'sim_active_stabilization', False) and getattr(self, 'sim_is_armed', False):
+                    # Simulator station-hold: capture the current point and keep
+                    # only centimetre-scale sensor noise around it.
+                    if self.sim_stab_hold_lat is None:
+                        self.sim_stab_hold_lat = lat
+                        self.sim_stab_hold_lon = lon
+                        self.sim_stab_hold_heading = heading
+                    lat = self.sim_stab_hold_lat + random.uniform(-2e-7, 2e-7)
+                    lon = self.sim_stab_hold_lon + random.uniform(-2e-7, 2e-7)
+                    target_h = self.sim_stab_hold_heading if self.sim_stab_hold_heading is not None else heading
+                    h_err = (target_h - heading + 180.0) % 360.0 - 180.0
+                    heading = (heading + max(-0.5, min(0.5, h_err))) % 360.0
+                    pwm_rc1 = 1500
+                    pwm_rc2 = 1500 if abs(h_err) < 1.0 else (1560 if h_err > 0 else 1440)
+                    pwm_rc3 = 1500
+                else:
+                    # Normal yaw drift when not navigating autonomously
+                    heading = (heading + 0.1 * math.sin(step * 0.01) + random.uniform(-0.1, 0.1)) % 360.0
+                    
+                    # Keep idle demo GPS telemetry in a small area (roughly a few metres)
+                    # around the configured site instead of allowing unbounded drift.
+                    lat = base_lat + 0.000025 * math.sin(step * 0.018) + random.uniform(-2e-7, 2e-7)
+                    lon = base_lon + 0.000025 * math.cos(step * 0.015) + random.uniform(-2e-7, 2e-7)
+                    
+                    # In manual mode, display commanded joystick values from GUI
+                    pwm_rc1 = getattr(self, 'sim_pwm_rc1', 1500)
+                    pwm_rc2 = getattr(self, 'sim_pwm_rc2', 1500)
+                    pwm_rc3 = getattr(self, 'sim_pwm_rc3', 1500)
+            
+            # Fixed GPS lock for the connected dashboard demonstration.
+            sats = 12
+            
+            # Distance (obstacle/seabed)
+            dist = 45.2 + 8.0 * math.sin(step * 0.02) + random.uniform(-0.1, 0.1)
+            
+            # Confidence (0 to 100 %)
+            conf = 95.0 + 3.0 * math.sin(step * 0.05) + random.uniform(-1.0, 1.0)
+            conf = max(0.0, min(100.0, conf))
+            
+            # Magnetic sensor values rotating with heading
+            mx = 22.4 * math.cos(math.radians(heading)) + random.uniform(-0.4, 0.4)
+            my = 22.4 * math.sin(math.radians(heading)) + random.uniform(-0.4, 0.4)
+            mz = -38.6 + random.uniform(-0.3, 0.3)
+            
+            # Simulate chamber temperature (DS18B20 sensor)
+            chamber_temp = 31.5 + 4.0 * math.sin(step * 0.01) + random.uniform(-0.05, 0.05)
+            
+            # Simulate BMS battery parameters
+            bms_volt = 25.2 - (step * 0.0005) % 3.2
+            bms_curr = 2.5 + (8.5 if (self.mission_active or getattr(self, 'rth_active', False)) else 0.0) + random.uniform(-0.3, 0.3)
+            bms_soc = max(0, int(100 - (step * 0.002) % 100))
+            bms_remaining_ah = 15.0 * bms_soc / 100.0
+            bms_soh = 99
+            bms_temp = 25.0 + math.sin(step * 0.05) * 2.0
+            
+            # Simulate Ping360 scanning sonar
+            is_sonar_active = getattr(self, 'sim_sonar_active', False)
+            if is_sonar_active:
+                sim_sonar_scan = round((step * 4.5) % 360.0, 1)
+                sim_sonar_range = round(max(0.8, 3.45 + 1.35 * math.sin(step * 0.06)), 2)
+                sim_sonar_bearing = round((125.0 + 30.0 * math.cos(step * 0.03)) % 360.0, 1)
+            else:
+                sim_sonar_scan = 0.0
+                sim_sonar_range = None
+                sim_sonar_bearing = None
+
+            # Magnetic Docking Simulation
+            sim_docking = 1 if getattr(self, 'sim_is_docking', False) else 0
+            if sim_docking:
+                dock_step = getattr(self, 'sim_dock_step', 0)
+                self.sim_dock_step = dock_step + 1
+                if dock_step < 30: # 3 seconds calibration (0 to 100%)
+                    sim_dock_stage = "CALIBRATING_COIL_OFF"
+                    sim_dock_cal_prog = int((dock_step / 30.0) * 100)
+                    sim_dock_base_ready = 0
+                    sim_dock_guideline = f"PHASE 1: KEEP BEACON COIL OFF! Capturing Earth baseline ({sim_dock_cal_prog}%)..."
+                    sim_dock_cmd = "CALIBRATING"
+                    sim_dock_axis = "stall"
+                    sim_dock_rng = None
+                    sim_dock_err = None
+                    sim_dock_hdg = None
+                    sim_dock_mag = None
+                    sim_dock_quality = None
+                elif dock_step < 55: # 2.5 seconds waiting for coil energization
+                    sim_dock_stage = "BASELINE_READY_COIL_ON"
+                    sim_dock_cal_prog = 100
+                    sim_dock_base_ready = 1
+                    sim_dock_guideline = "PHASE 2: EARTH BASELINE CAPTURED! TURN ON / ENERGIZE BEACON COIL NOW TO LOCK."
+                    sim_dock_cmd = "WAIT_COIL"
+                    sim_dock_axis = "stall"
+                    sim_dock_rng = None
+                    sim_dock_err = None
+                    sim_dock_hdg = None
+                    sim_dock_mag = 2.4
+                    sim_dock_quality = 0.4
+                elif dock_step < 125: # Homing approach from 2.5m down to 0.14m
+                    sim_dock_stage = "HOMING_LOCKED"
+                    sim_dock_cal_prog = 100
+                    sim_dock_base_ready = 1
+                    frac = (dock_step - 55) / 70.0
+                    sim_dock_rng = round(max(0.14, 2.5 * (1.0 - frac)), 2)
+                    sim_dock_err = round(max(-20.0, min(20.0, 15.0 * math.sin(dock_step * 0.1))), 1)
+                    sim_dock_hdg = round((180.0 + sim_dock_err) % 360.0, 1)
+                    sim_dock_mag = round(6.0 + 35.0 * frac, 1)
+                    sim_dock_quality = 0.95
+                    if abs(sim_dock_err) > 8.0:
+                        sim_dock_cmd = "LEFT" if sim_dock_err < 0 else "RIGHT"
+                        sim_dock_axis = "T2 yaw"
+                        sim_dock_guideline = f"PHASE 3: YAW ALIGNMENT -> Turn {sim_dock_cmd} ({sim_dock_err:+.1f}°) to center beacon."
+                    else:
+                        sim_dock_cmd = "FORWARD"
+                        sim_dock_axis = "T1 surge"
+                        sim_dock_guideline = f"PHASE 3: SURGE RUN-IN -> Forward drive ({sim_dock_rng:.2f}m) to dock cone."
+                else: # Arrived & docked!
+                    sim_dock_stage = "DOCKED"
+                    sim_dock_cal_prog = 100
+                    sim_dock_base_ready = 1
+                    sim_dock_rng = 0.12
+                    sim_dock_err = 0.0
+                    sim_dock_hdg = 180.0
+                    sim_dock_mag = 45.0
+                    sim_dock_cmd = "HOLD"
+                    sim_dock_axis = "hold"
+                    sim_dock_quality = 0.98
+                    sim_dock_guideline = "PHASE 3 COMPLETE: VEHICLE DOCKED (<0.15m). Station holding active."
+            else:
+                self.sim_dock_step = 0
+                sim_dock_stage = "STANDBY"
+                sim_dock_cal_prog = 0
+                sim_dock_base_ready = 0
+                sim_dock_guideline = "Docking standby. Press Engage to start Earth baseline calibration."
+                sim_dock_cmd = "NULL"
+                sim_dock_axis = "stall"
+                sim_dock_rng = None
+                sim_dock_err = None
+                sim_dock_hdg = None
+                sim_dock_mag = None
+                sim_dock_quality = None
+
+            if getattr(self, 'sim_active_stabilization', False):
+                sim_stab_mode = "PATH" if (self.mission_active or getattr(self, 'rth_active', False)) else ("HOLD" if self.sim_is_armed else "DISARMED")
+            else:
+                sim_stab_mode = "OFF"
+
+            data = {
+                "roll": round(roll, 2),
+                "pitch": round(pitch, 2),
+                "yaw": round(heading, 2),
+                "latitude": round(lat, 7),
+                "longitude": round(lon, 7),
+                "satellites": sats,
+                "distance": round(dist, 2),
+                "confidence": round(conf, 1),
+                "mx": round(mx, 1),
+                "my": round(my, 1),
+                "mz": round(mz, 1),
+                "chamber_temp": round(chamber_temp, 2),
+                "bms_volt": round(bms_volt, 2),
+                "bms_curr": round(bms_curr, 2),
+                "bms_soc": bms_soc,
+                "bms_remaining_ah": round(bms_remaining_ah, 2),
+                "bms_soh": bms_soh,
+                "bms_temp": round(bms_temp, 2),
+                "pwm_rc1": pwm_rc1,
+                "pwm_rc2": pwm_rc2,
+                "pwm_rc3": pwm_rc3,
+                "sonar_range": sim_sonar_range,
+                "sonar_bearing": sim_sonar_bearing,
+                "sonar_scan_angle": sim_sonar_scan,
+                "sonar_active": 1 if is_sonar_active else 0,
+                "is_armed": 1 if getattr(self, 'sim_is_armed', False) else 0,
+                "running": 1 if (self.mission_active or getattr(self, 'rth_active', False)) else 0,
+                "active_stabilization": 1 if getattr(self, 'sim_active_stabilization', False) else 0,
+                "stabilization_mode": sim_stab_mode,
+                "cross_track_m": 0.0,
+                "stabilization_correction_deg": 0.0,
+                "stabilization_hold_distance_m": 0.0,
+                "rec": 1 if getattr(self, 'sim_is_recording', False) else 0,
+                "docking": sim_docking,
+                "dock_stage": sim_dock_stage,
+                "dock_cal_progress": sim_dock_cal_prog,
+                "dock_base_ready": sim_dock_base_ready,
+                "dock_guideline": sim_dock_guideline,
+                "dock_cmd": sim_dock_cmd,
+                "dock_axis": sim_dock_axis,
+                "dock_range": sim_dock_rng,
+                "dock_err": sim_dock_err,
+                "dock_heading": sim_dock_hdg,
+                "dock_mag": sim_dock_mag,
+                "dock_quality": sim_dock_quality,
+                "mode": "Simulated"
+            }
+
+            if getattr(self, 'sim_rec_target_time', None) is not None:
+                if time.time() >= self.sim_rec_target_time:
+                    self.sim_is_recording = True
+                    self.sim_rec_target_time = None
+                    print("[Simulator] 15s warmup complete. Recording active.")
+
+            self.data_received.emit(data)
+            step += 1
+            self.msleep(100) # Update at 10Hz
+            
+        self.connection_status.emit(False, "Simulator Stopped")
+
+    def run_serial(self):
+        if not SERIAL_AVAILABLE:
+            self.connection_status.emit(False, "PySerial module unavailable")
+            return
+
+        self.serial_port = None
+        try:
+            self.serial_port = serial.Serial(self.port, self.baudrate, timeout=1.0)
+            self.connection_status.emit(True, f"Connected to {self.port}")
+            
+            last_hb_tx = 0.0
+            
+            while self.running:
+                self._flush_tx_queue()
+                now = time.time()
+                
+                # Transmit heartbeat command at 1.0Hz
+                if now - last_hb_tx >= 1.0:
+                    self.send_heartbeat()
+                    last_hb_tx = now
+                
+                if self.serial_port.in_waiting > 0:
+                    line = self.serial_port.readline().decode('utf-8', errors='ignore').strip()
+                    if not line:
+                        continue
+                    self.raw_line_received.emit(line)
+                    
+                    if self._handle_special_line(line):
+                        continue
+                        
+                    parsed_data = self.parse_data(line)
+                    if parsed_data:
+                        self.data_received.emit(parsed_data)
+                else:
+                    self.msleep(5)
+                
+        except serial.SerialException as e:
+            self.connection_status.emit(False, f"Serial Error: {str(e)}")
+        except Exception as e:
+            self.connection_status.emit(False, f"Error: {str(e)}")
+        finally:
+            if self.serial_port and self.serial_port.is_open:
+                self.serial_port.close()
+            self.serial_port = None
+            self.connection_status.emit(False, "Disconnected")
+
+    def _transport_ready_for_tx(self):
+        if self.port == "SIMULATOR":
+            return True
+        if self.port in ("TCP CLIENT", "UDP CLIENT"):
+            return self.socket_conn is not None
+        return bool(getattr(self, "serial_port", None) and self.serial_port.is_open)
+
+    @staticmethod
+    def _is_urgent_command(text):
+        up = str(text).strip().upper()
+        return (up in ("STOP", "$STOP", "DISARM", "$DISARM")
+                or up.startswith("$DOCK,STOP") or up.startswith("DOCK,STOP"))
+
+    @staticmethod
+    def _is_manual_wire_command(text):
+        # After translation, manual/heartbeat-compatible commands are exactly
+        # five numeric comma-separated fields: T1,T2,T3,light,camera.
+        parts = str(text).strip().split(",")
+        if len(parts) != 5:
+            return False
+        try:
+            [float(x) for x in parts]
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _is_fusion_wire_command(text):
+        up = str(text).strip().upper()
+        return up.startswith("$FUSE,") or up.startswith("FUSE,")
+
+    def _enqueue_tx(self, translated):
+        """Queue one already-translated line without blocking the Qt GUI thread."""
+        if self.port == "SIMULATOR":
+            return True
+        if not self._transport_ready_for_tx():
+            return False
+        packet = (str(translated).rstrip("\r\n") + "\n").encode("utf-8")
+
+        # Manual commands are state, not events.  Keep only the newest one so a
+        # temporary link stall can never replay seconds of stale joystick/PWM
+        # values when communications recover.
+        if self._is_manual_wire_command(translated):
+            with self._manual_tx_lock:
+                self._pending_manual_packet = packet
+            return True
+
+        # Fused target updates are also state, not events. Keep only the newest
+        # estimate so a congested RF/TCP link cannot replay stale docking targets.
+        if self._is_fusion_wire_command(translated):
+            with self._manual_tx_lock:
+                self._pending_fusion_packet = packet
+            return True
+
+        # Safety commands pre-empt every older queued action and pending manual
+        # output.  This also prevents a delayed ARM/START from following DISARM.
+        if self._is_urgent_command(translated):
+            self._clear_tx_queue()
+            with self._manual_tx_lock:
+                self._pending_manual_packet = None
+                self._pending_fusion_packet = None
+            try:
+                self._tx_queue.put_nowait(packet)
+                return True
+            except queue.Full:
+                return False
+
+        try:
+            self._tx_queue.put_nowait(packet)
+            return True
+        except queue.Full:
+            self._tx_drop_count += 1
+            if self._tx_drop_count == 1 or self._tx_drop_count % 25 == 0:
+                print(f"[TX QUEUE] Dropped {self._tx_drop_count} packet(s): link is not draining fast enough")
+            return False
+
+    def _flush_tx_queue(self, max_packets=24):
+        """Run only from the telemetry QThread; perform the potentially blocking I/O here."""
+        sent = 0
+        serial_used = False
+        while sent < max_packets:
+            try:
+                packet = self._tx_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if self.port == "TCP CLIENT" and self.socket_conn:
+                    self.socket_conn.sendall(packet)
+                elif self.port == "UDP CLIENT" and self.socket_conn and self.udp_send_addr:
+                    self.socket_conn.sendto(packet, self.udp_send_addr)
+                elif getattr(self, "serial_port", None) and self.serial_port.is_open:
+                    self.serial_port.write(packet)
+                    serial_used = True
+                else:
+                    # Transport vanished after enqueue.  Do not replay stale motor
+                    # commands after a later reconnect.
+                    continue
+                sent += 1
+            except Exception as exc:
+                print(f"[TX Worker Error] {exc}")
+                break
+        # Send at most one latest fused-target state after event/control commands.
+        with self._manual_tx_lock:
+            fusion_packet = self._pending_fusion_packet
+            self._pending_fusion_packet = None
+        if fusion_packet is not None:
+            try:
+                if self.port == "TCP CLIENT" and self.socket_conn:
+                    self.socket_conn.sendall(fusion_packet)
+                    sent += 1
+                elif self.port == "UDP CLIENT" and self.socket_conn and self.udp_send_addr:
+                    self.socket_conn.sendto(fusion_packet, self.udp_send_addr)
+                    sent += 1
+                elif getattr(self, "serial_port", None) and self.serial_port.is_open:
+                    self.serial_port.write(fusion_packet)
+                    serial_used = True
+                    sent += 1
+            except Exception as exc:
+                print(f"[TX Worker Error] fusion: {exc}")
+
+        # Send at most one latest manual state after event/control commands.
+        with self._manual_tx_lock:
+            manual_packet = self._pending_manual_packet
+            self._pending_manual_packet = None
+        if manual_packet is not None:
+            try:
+                if self.port == "TCP CLIENT" and self.socket_conn:
+                    self.socket_conn.sendall(manual_packet)
+                    sent += 1
+                elif self.port == "UDP CLIENT" and self.socket_conn and self.udp_send_addr:
+                    self.socket_conn.sendto(manual_packet, self.udp_send_addr)
+                    sent += 1
+                elif getattr(self, "serial_port", None) and self.serial_port.is_open:
+                    self.serial_port.write(manual_packet)
+                    serial_used = True
+                    sent += 1
+            except Exception as exc:
+                print(f"[TX Worker Error] {exc}")
+
+        if serial_used:
+            try:
+                self.serial_port.flush()
+            except Exception:
+                pass
+        return sent
+
+    def _clear_tx_queue(self):
+        try:
+            while True:
+                self._tx_queue.get_nowait()
+        except queue.Empty:
+            pass
+        if hasattr(self, "_manual_tx_lock"):
+            with self._manual_tx_lock:
+                self._pending_manual_packet = None
+                self._pending_fusion_packet = None
+
+    def write_data(self, data_str):
+        if not hasattr(self, 'light_state'):
+            self.light_state = 0
+        if not hasattr(self, 'camera_state'):
+            self.camera_state = 0
+            
+        translated = data_str
+        if data_str.startswith("CMD,") or data_str.startswith("$CMD,"):
+            parts = data_str.split(',')
+            rc1 = parts[1] if len(parts) > 1 else "1500"
+            rc2 = parts[2] if len(parts) > 2 else "1500"
+            rc3 = parts[3] if len(parts) > 3 else "1500"
+            lit = parts[4] if len(parts) > 4 else str(self.light_state)
+            cam = parts[5] if len(parts) > 5 else str(self.camera_state)
+            # Incoming command format expected by Teensy: pwm1,pwm2,pwm3,light,camera (e.g. 1600,1500,1400,1,0)
+            translated = f"{rc1},{rc2},{rc3},{lit},{cam}"
+            try:
+                self.sim_pwm_rc1 = int(float(rc1))
+                self.sim_pwm_rc2 = int(float(rc2))
+                self.sim_pwm_rc3 = int(float(rc3))
+            except Exception:
+                pass
+        elif "," in data_str and not data_str.startswith("$") and not data_str.startswith("["):
+            parts = data_str.split(',')
+            if len(parts) == 5:
+                try:
+                    self.sim_pwm_rc1 = int(float(parts[0]))
+                    self.sim_pwm_rc2 = int(float(parts[1]))
+                    self.sim_pwm_rc3 = int(float(parts[2]))
+                    translated = data_str
+                except Exception:
+                    pass
+        elif data_str.startswith("$MANUAL,"):
+            parts = data_str.split(',')
+            rc1 = parts[1] if len(parts) > 1 else "1500"
+            rc2 = parts[2] if len(parts) > 2 else "1500"
+            rc3 = parts[3] if len(parts) > 3 else "1500"
+            translated = f"{rc1},{rc2},{rc3},{self.light_state},{self.camera_state}"
+            
+            # Store manual values for simulator feedback
+            try:
+                self.sim_pwm_rc1 = int(float(rc1))
+                self.sim_pwm_rc2 = int(float(rc2))
+                self.sim_pwm_rc3 = int(float(rc3))
+            except Exception:
+                pass
+        elif data_str.startswith("$ARM"):
+            translated = "ARM"
+            self.sim_is_armed = True
+            self.sim_pwm_rc1 = 1500
+            self.sim_pwm_rc2 = 1500
+            self.sim_pwm_rc3 = 1500
+        elif data_str.startswith("$DISARM"):
+            translated = "DISARM"
+            self.sim_is_armed = False
+            self.sim_stab_hold_lat = None
+            self.sim_stab_hold_lon = None
+            self.sim_stab_hold_heading = None
+            self.sim_pwm_rc1 = 1500
+            self.sim_pwm_rc2 = 1500
+            self.sim_pwm_rc3 = 1500
+        elif data_str.startswith("$START"):
+            translated = "START"
+            self.mission_active = True
+            self.rth_active = False
+            self.current_wp_index = 0
+        elif data_str.startswith("$STOP"):
+            translated = "STOP"
+            self.mission_active = False
+            self.rth_active = False
+            if self.sim_active_stabilization:
+                self.sim_stab_hold_lat = None
+                self.sim_stab_hold_lon = None
+                self.sim_stab_hold_heading = None
+            self.sim_pwm_rc1 = 1500
+            self.sim_pwm_rc2 = 1500
+            self.sim_pwm_rc3 = 1500
+        elif data_str.startswith("$RTH"):
+            translated = "RTH"
+            self.rth_active = True
+            self.mission_active = False
+        elif data_str.startswith("$WP,"):
+            translated = data_str[1:]  # Send coordinate payload directly (e.g. WP,idx,lat,lon)
+        elif data_str in ("$HB", "HB"):
+            translated = "HB"
+        elif data_str.startswith("$H"):
+            translated = f"1500,1500,1500,{self.light_state},{self.camera_state}"
+            self.sim_pwm_rc1 = 1500
+            self.sim_pwm_rc2 = 1500
+            self.sim_pwm_rc3 = 1500
+        elif data_str.startswith("$STABILIZE") or data_str.startswith("STABILIZE"):
+            translated = data_str
+            parts = [p.strip() for p in data_str.split(",")]
+            action = parts[1].upper() if len(parts) > 1 else "STATUS"
+            if action in ("ON", "1", "START", "ENABLE"):
+                self.stabilization_active = True
+                self.sim_active_stabilization = True
+                self.sim_stab_hold_lat = None
+                self.sim_stab_hold_lon = None
+                self.sim_stab_hold_heading = None
+            elif action in ("OFF", "0", "STOP", "DISABLE"):
+                self.stabilization_active = False
+                self.sim_active_stabilization = False
+                self.sim_stab_hold_lat = None
+                self.sim_stab_hold_lon = None
+                self.sim_stab_hold_heading = None
+        elif data_str.startswith("$FUSE") or data_str.startswith("FUSE"):
+            translated = data_str
+            # Exercise the backend acknowledgement path in SIMULATOR mode.
+            if self.port == "SIMULATOR":
+                parts = [p.strip() for p in data_str.lstrip("$").split(",")]
+                action = parts[1].upper() if len(parts) > 1 else "STATUS"
+                if action in ("STATUS", "?", "STATE"):
+                    state = dict(self.fusion_backend_state)
+                    state.update(connected=True, timestamp=time.monotonic(), error="")
+                else:
+                    try:
+                        valid = int(float(parts[1] or 0)) == 1
+                    except (TypeError, ValueError):
+                        valid = False
+
+                    def _f(i):
+                        try:
+                            return float(parts[i]) if i < len(parts) and parts[i] != "" else None
+                        except (TypeError, ValueError):
+                            return None
+
+                    state = {
+                        "connected": True, "valid": valid,
+                        "range_m": _f(2) if valid else None,
+                        "bearing_rel_deg": _f(3) if valid else None,
+                        "sigma_m": _f(4) if valid else None,
+                        "sources": parts[5] if valid and len(parts) > 5 else "",
+                        "stage": parts[6] if valid and len(parts) > 6 and parts[6] else "NO_FIX",
+                        "age_s": 0.0, "timestamp": time.monotonic(), "error": ""
+                    }
+                self.fusion_backend_state = state
+                self.fusion_status_received.emit(dict(state))
+        elif data_str.startswith("$REC,") or data_str.startswith("REC,"):
+            translated = data_str
+            if "START" in data_str:
+                self.camera_state = 1
+                self.sim_rec_target_time = time.time() + 15.0
+                self.sim_is_recording = False
+                print("[Simulator] Camera powered ON. 15s warmup initiated.")
+            elif "STOP" in data_str:
+                self.sim_is_recording = False
+                self.sim_rec_target_time = None
+                print("[Simulator] Camera recording stopped.")
+        elif data_str.startswith("$CONFIG,") or data_str.startswith("CONFIG,"):
+            translated = data_str
+            try:
+                for item in data_str.split(",")[1:]:
+                    if "=" not in item:
+                        continue
+                    key, value = item.split("=", 1)
+                    if key.strip().upper() == "WAYPOINT_TOLERANCE":
+                        self.sim_wp_tolerance = max(0.3, min(20.0, float(value)))
+            except Exception:
+                pass
+        elif data_str.startswith("$DOCK") or data_str.startswith("DOCK"):
+            translated = data_str
+            if "START" in data_str or data_str in ("$DOCK", "DOCK"):
+                self.sim_is_docking = True
+                print("[Simulator] Magnetic docking active.")
+            elif "STOP" in data_str:
+                self.sim_is_docking = False
+                print("[Simulator] Magnetic docking stopped.")
+        elif data_str.startswith("$SONAR") or data_str.startswith("SONAR"):
+            translated = data_str
+            if "START" in data_str or data_str in ("$SONAR", "SONAR", "$SONAR,1", "SONAR,1"):
+                self.sim_sonar_active = True
+                print("[Simulator] Ping360 scanning sonar active.")
+            elif "STOP" in data_str or data_str in ("$SONAR,0", "SONAR,0"):
+                self.sim_sonar_active = False
+                print("[Simulator] Ping360 scanning sonar stopped.")
+            
+            
+        # Simulator commands are handled by the state updates above; report
+        # success so the GUI can coalesce unchanged manual packets normally.
+        if self.port == "SIMULATOR":
+            return True
+
+        # Live transports are written by the telemetry worker thread, never by
+        # the Qt GUI thread.  This keeps map interaction/buttons responsive even
+        # when RF/TCP temporarily stalls.
+        return self._enqueue_tx(translated)
+
+    def send_heartbeat(self):
+        # During AUTO/RTH the watchdog must stay alive without sending a neutral
+        # manual-thruster packet, because that would overwrite autonomous output.
+        if (getattr(self, 'mission_active', False) or getattr(self, 'rth_active', False)
+                or getattr(self, 'stabilization_active', False)):
+            packet = b"HB\n"
+        else:
+            if not hasattr(self, 'light_state'):
+                self.light_state = 0
+            if not hasattr(self, 'camera_state'):
+                self.camera_state = 0
+            packet = f"1500,1500,1500,{self.light_state},{self.camera_state}\n".encode('utf-8')
+            
+        if self.port in ("TCP CLIENT", "UDP CLIENT") and self.socket_conn:
+            try:
+                if self.port == "TCP CLIENT":
+                    self.socket_conn.sendall(packet)
+                elif self.port == "UDP CLIENT" and self.udp_send_addr:
+                    self.socket_conn.sendto(packet, self.udp_send_addr)
+            except:
+                pass
+        elif hasattr(self, 'serial_port') and self.serial_port and self.serial_port.is_open:
+            try:
+                self.serial_port.write(packet)
+                self.serial_port.flush()
+            except:
+                pass
+
+    def parse_data(self, line):
+        """
+        Parses incoming telemetry packets in JSON or CSV format.
+        """
+        if not line:
+            return None
+
+        line_str = line.strip()
+
+        # 1. Support JSON format (Dry Test & Jetson Subsea Node)
+        if '{' in line_str and '}' in line_str:
+            try:
+                import json
+                start_idx = line_str.find('{')
+                end_idx = line_str.rfind('}') + 1
+                t = json.loads(line_str[start_idx:end_idx])
+
+                roll = float(t.get("roll", 0.0) or 0.0)
+                pitch = float(t.get("pitch", 0.0) or 0.0)
+                yaw = float(t.get("yaw", t.get("heading", 0.0)) or 0.0)
+                lat = float(t.get("latitude", t.get("lat", 0.0)) or 0.0)
+                lon = float(t.get("longitude", t.get("lon", 0.0)) or 0.0)
+                sats = int(float(t.get("satellites", t.get("no_of_satellites", t.get("sats", 0))) or 0))
+
+                chamber_temp = t.get("temp", t.get("chamber_temp", 0.0))
+                if chamber_temp is None or (isinstance(chamber_temp, float) and chamber_temp != chamber_temp):
+                    chamber_temp = 0.0
+                chamber_hum = t.get("hum", t.get("chamber_hum", 0.0))
+                if chamber_hum is None or (isinstance(chamber_hum, float) and chamber_hum != chamber_hum):
+                    chamber_hum = 0.0
+
+                # Magnetometer RM3100
+                magX = float(t.get("magX", t.get("mx", 0.0)) or 0.0)
+                magY = float(t.get("magY", t.get("my", 0.0)) or 0.0)
+                magZ = float(t.get("magZ", t.get("mz", 0.0)) or 0.0)
+                magB_val = t.get("magB")
+                magB = float(magB_val) if magB_val is not None else math.sqrt(magX**2 + magY**2 + magZ**2)
+
+                bms_volt = float(t.get("battery_voltage", t.get("volts", 0.0)) or 0.0)
+                bms_curr = float(t.get("battery_current", t.get("amps", 0.0)) or 0.0)
+                bms_power = float(t.get("battery_power", t.get("watts", round(bms_volt * bms_curr, 2))) or 0.0)
+                bms_soc = int(float(t.get("soc", 0) or 0))
+                bms_soh = int(float(t.get("soh", 100) or 100))
+                bms_temp = float(t.get("battery_temp", t.get("afe_temp", t.get("afe", 25.0))) or 25.0)
+                bms_remaining_ah = round(15.0 * bms_soc / 100.0, 2)
+
+                pwm_rc1 = int(float(t.get("t1", t.get("p1", 1500)) or 1500))
+                pwm_rc2 = int(float(t.get("t2", t.get("p2", 1500)) or 1500))
+                pwm_rc3 = int(float(t.get("t3", t.get("p3", 1500)) or 1500))
+
+                light = int(float(t.get("light", t.get("lit", 0)) or 0))
+                camera = int(float(t.get("camera", t.get("cam", 0)) or 0))
+                failsafe = int(float(t.get("failsafe", 0) or 0))
+
+                # Ping360 Obstacle Sonar
+                sonar_range = t.get("sonar_range", t.get("obstacle_distance_meters"))
+                if sonar_range is not None:
+                    try:
+                        sonar_range = float(sonar_range)
+                        if sonar_range != sonar_range or sonar_range < 0.0: # NaN / invalid range
+                            sonar_range = None
+                    except (ValueError, TypeError):
+                        sonar_range = None
+
+                sonar_bearing = t.get("sonar_bearing", t.get("obstacle_angle_deg"))
+                if sonar_bearing is not None:
+                    try:
+                        sonar_bearing = float(sonar_bearing)
+                        if sonar_bearing != sonar_bearing:
+                            sonar_bearing = None
+                        elif sonar_bearing is not None:
+                            sonar_bearing %= 360.0
+                    except (ValueError, TypeError):
+                        sonar_bearing = None
+
+                sonar_scan_angle = t.get("sonar_scan_angle", t.get("angle_deg", 0.0))
+                try:
+                    sonar_scan_angle = float(sonar_scan_angle) if sonar_scan_angle is not None else 0.0
+                    sonar_scan_angle %= 360.0
+                except (ValueError, TypeError):
+                    sonar_scan_angle = 0.0
+
+                sonar_active = int(float(t.get("sonar_active", 0) or 0))
+                if sonar_range is not None or sonar_scan_angle != 0.0:
+                    sonar_active = 1
+
+                return {
+                    "raw_packet": line_str,
+                    "roll": roll,
+                    "pitch": pitch,
+                    "yaw": yaw,
+                    "latitude": lat,
+                    "longitude": lon,
+                    "satellites": sats,
+                    # Ping360 range is the only subsea distance source after
+                    # removal of the BarX100 depth/pressure sensor.
+                    "distance": sonar_range if sonar_range is not None else 0.0,
+                    "confidence": 100.0 if sonar_range is not None else 0.0,
+                    "mx": magX,
+                    "my": magY,
+                    "mz": magZ,
+                    "magX": magX,
+                    "magY": magY,
+                    "magZ": magZ,
+                    "magB": magB,
+                    "chamber_temp": chamber_temp,
+                    "chamber_hum": chamber_hum,
+                    "bms_volt": bms_volt,
+                    "bms_curr": bms_curr,
+                    "bms_power": bms_power,
+                    "bms_soc": bms_soc,
+                    "bms_remaining_ah": bms_remaining_ah,
+                    "bms_soh": bms_soh,
+                    "bms_temp": bms_temp,
+                    "pwm_rc1": pwm_rc1,
+                    "pwm_rc2": pwm_rc2,
+                    "pwm_rc3": pwm_rc3,
+                    "light": light,
+                    "camera": camera,
+                    "failsafe": failsafe,
+                    "sonar_range": sonar_range,
+                    "sonar_bearing": sonar_bearing,
+                    "sonar_scan_angle": sonar_scan_angle,
+                    "sonar_active": sonar_active,
+                    "target_wp": int(float(t.get("target_wp", 0) or 0)),
+                    "total_wps": int(float(t.get("total_wps", 0) or 0)),
+                    "target_bearing": float(t.get("target_bearing", 0.0) or 0.0),
+                    "heading_err": float(t.get("heading_err", 0.0) or 0.0),
+                    "nav_dir": str(t.get("nav_dir", "STANDBY")),
+                    "active_stabilization": int(float(t.get("active_stabilization", 0) or 0)),
+                    "stabilization_mode": str(t.get("stabilization_mode", "OFF")),
+                    "cross_track_m": float(t.get("cross_track_m", 0.0) or 0.0),
+                    "stabilization_correction_deg": float(t.get("stabilization_correction_deg", 0.0) or 0.0),
+                    "stabilization_hold_distance_m": float(t.get("stabilization_hold_distance_m", 0.0) or 0.0),
+                    "fusion_valid": int(float(t.get("fusion_valid", 0) or 0)),
+                    "fusion_range_m": float(t["fusion_range_m"]) if t.get("fusion_range_m") is not None else None,
+                    "fusion_bearing_rel_deg": float(t["fusion_bearing_rel_deg"]) if t.get("fusion_bearing_rel_deg") is not None else None,
+                    "fusion_sigma_m": float(t["fusion_sigma_m"]) if t.get("fusion_sigma_m") is not None else None,
+                    "fusion_sources": str(t.get("fusion_sources", "")),
+                    "fusion_stage": str(t.get("fusion_stage", "NO_FIX")),
+                    "fusion_age_s": float(t["fusion_age_s"]) if t.get("fusion_age_s") is not None else None,
+                    "is_armed": int(float(t.get("is_armed", 0) or 0)),
+                    "running": int(float(t.get("running", 0) or 0)),
+                    "rec": int(float(t.get("rec", 0) or 0)),
+                    "docking": int(float(t.get("docking", 0) or 0)),
+                    "dock_cmd": str(t.get("dock_cmd", "NULL")),
+                    "dock_axis": str(t.get("dock_axis", "stall")),
+                    "dock_range": float(t["dock_range"]) if t.get("dock_range") is not None else None,
+                    "dock_err": float(t["dock_err"]) if t.get("dock_err") is not None else None,
+                    "dock_heading": float(t["dock_heading"]) if t.get("dock_heading") is not None else None,
+                    "dock_mag": float(t["dock_mag"]) if t.get("dock_mag") is not None else None,
+                    "dock_quality": float(t["dock_quality"]) if t.get("dock_quality") is not None else None,
+                    "dock_base_ready": int(float(t.get("dock_base_ready", 0) or 0)),
+                    "dock_cal_progress": int(float(t.get("dock_cal_progress", 0) or 0)),
+                    "dock_stage": str(t.get("dock_stage", "STANDBY")),
+                    "dock_guideline": str(t.get("dock_guideline", "")),
+                    "dock_stage": str(t.get("dock_stage", "STANDBY")),
+                    "dock_guideline": str(t.get("dock_guideline", "")),
+                    "gps_valid": int(float(t.get("gps_valid", 1 if (lat != 0.0 or lon != 0.0) else 0))),
+                    "gps": str(t.get("gps", t.get("gps_status", "FIX" if (lat != 0.0 or lon != 0.0) else "NO_FIX"))),
+                    "gps_status": str(t.get("gps_status", t.get("gps", "FIX" if (lat != 0.0 or lon != 0.0) else "NO_FIX"))),
+                    "utc": str(t.get("utc", t.get("time_utc", ""))),
+                    "time_utc": str(t.get("time_utc", t.get("utc", ""))),
+                    "rm3100_valid": int(float(t.get("rm3100_valid", 0 if (magX == 0.0 and magY == 0.0 and magZ == 0.0) else 1))),
+                    "mag_total": float(t.get("mag_total", t.get("magB", magB)) or 0.0),
+                    "altitude": float(t.get("altitude", t.get("alt_m", t.get("alt", 0.0))) or 0.0),
+                    "alt_m": float(t.get("alt_m", t.get("altitude", t.get("alt", 0.0))) or 0.0),
+                    "alt": float(t.get("alt", t.get("altitude", t.get("alt_m", 0.0))) or 0.0),
+                    "hdop": float(t.get("hdop", 0.0) or 0.0),
+                    "speed": float(t.get("speed", t.get("speed_kmph", 0.0)) or 0.0),
+                    "speed_kmph": float(t.get("speed_kmph", t.get("speed", 0.0)) or 0.0),
+                    "course": float(t.get("course", t.get("course_deg", 0.0)) or 0.0),
+                    "course_deg": float(t.get("course_deg", t.get("course", 0.0)) or 0.0),
+                    "sat": int(float(t.get("sat", t.get("satellites", sats)) or 0)),
+                    "valid": int(float(t.get("valid", t.get("teensy_valid", 15)) or 15)),
+                    "teensy_valid": int(float(t.get("teensy_valid", t.get("valid", 15)) or 15)),
+                    "cmds": int(float(t.get("cmds", t.get("teensy_cmds", t.get("cmd", 0))) or 0)),
+                    "cmd": int(float(t.get("cmd", t.get("cmds", t.get("teensy_cmds", 0))) or 0)),
+                    "mode": t.get("mode", "Subsea JSON")
+                }
+            except Exception:
+                pass
+
+        # 2. Support CSV format (25-element telemetry format, Teensy 23/26-element, or legacy format)
+        try:
+            clean_line = line_str.lstrip("[$#").rstrip("]\r\n")
+            parts = [p.strip() for p in clean_line.split(',')]
+
+            # Skip CSV header if received
+            if clean_line.lower().startswith("roll,pitch,yaw"):
+                return None
+
+            # Helper functions for safe conversions (ignoring nan, none, null, --)
+            def _to_f(v, def_val=0.0):
+                if v is None: return def_val
+                s = str(v).strip().lower()
+                if s in ("", "nan", "none", "null", "--"): return def_val
+                try:
+                    val = float(s)
+                    return val if math.isfinite(val) else def_val
+                except (ValueError, TypeError):
+                    return def_val
+
+            def _to_i(v, def_val=0):
+                if v is None: return def_val
+                s = str(v).strip().lower()
+                if s in ("", "nan", "none", "null", "--"): return def_val
+                try:
+                    return int(float(s))
+                except (ValueError, TypeError):
+                    return def_val
+
+            def _to_opt_f(v):
+                if v is None: return None
+                s = str(v).strip().lower()
+                if s in ("", "nan", "none", "null", "--"): return None
+                try:
+                    val = float(s)
+                    return val if math.isfinite(val) else None
+                except (ValueError, TypeError):
+                    return None
+
+            # 1. Check for standard 25-field telemetry format:
+            # roll,pitch,yaw,latitude,longitude,no_of_satellites,temperature,humidity,
+            # battery_volt,battery_current,battery_power,battery_temp,battery_soc,
+            # battery_soh,pwm1,pwm2,pwm3,light_status,camera_status,sonar_range,
+            # sonar_bearing,magx,magy,magz,magB
+            is_teensy_23_26 = (len(parts) in (23, 26)) and (900 <= _to_f(parts[2]) <= 2100)
+            is_teensy_22 = (len(parts) == 22) and (900 <= _to_f(parts[6]) <= 2100)
+
+            if len(parts) == 25 or (len(parts) >= 20 and not is_teensy_23_26 and not is_teensy_22):
+
+                roll = _to_f(parts[0])
+                pitch = _to_f(parts[1])
+                yaw = _to_f(parts[2])
+                lat = _to_f(parts[3])
+                lon = _to_f(parts[4])
+                sats = _to_i(parts[5])
+                temp = _to_f(parts[6])
+                hum = _to_f(parts[7])
+                b_volt = _to_f(parts[8])
+                b_curr = _to_f(parts[9])
+                b_power = _to_f(parts[10])
+                b_temp = _to_f(parts[11])
+                b_soc = _to_i(parts[12])
+                b_soh = _to_i(parts[13], 100)
+                pwm1 = _to_i(parts[14], 1500)
+                pwm2 = _to_i(parts[15], 1500)
+                pwm3 = _to_i(parts[16], 1500)
+                light = _to_i(parts[17]) if len(parts) > 17 else 0
+                camera = _to_i(parts[18]) if len(parts) > 18 else 0
+                sonar_r = _to_opt_f(parts[19]) if len(parts) > 19 else None
+                sonar_b = _to_opt_f(parts[20]) if len(parts) > 20 else None
+                mx = _to_f(parts[21]) if len(parts) > 21 else 0.0
+                my = _to_f(parts[22]) if len(parts) > 22 else 0.0
+                mz = _to_f(parts[23]) if len(parts) > 23 else 0.0
+                magB = _to_f(parts[24]) if len(parts) > 24 else 0.0
+
+                if b_power == 0.0 and b_volt > 0.0 and b_curr != 0.0:
+                    b_power = round(b_volt * b_curr, 2)
+
+                if magB == 0.0 and (mx != 0.0 or my != 0.0 or mz != 0.0):
+                    magB = round(math.sqrt(mx**2 + my**2 + mz**2), 3)
+
+                rm3100_valid = not (mx == 0.0 and my == 0.0 and mz == 0.0 and magB == 0.0)
+                is_gps_connected = (abs(lat) > 0.0001 or abs(lon) > 0.0001) or (sats > 0)
+                gps_valid = 1 if is_gps_connected else 0
+                if not is_gps_connected:
+                    lat = 0.0
+                    lon = 0.0
+                    sats = 0
+
+                return {
+                    "raw_packet": line_str,
+                    "roll": roll,
+                    "pitch": pitch,
+                    "yaw": yaw,
+                    "heading": yaw,
+                    "latitude": lat,
+                    "lat": lat,
+                    "longitude": lon,
+                    "lon": lon,
+                    "satellites": sats,
+                    "sat": sats,
+                    "no_of_satellites": sats,
+                    "temperature": temp,
+                    "chamber_temp": temp,
+                    "temp": temp,
+                    "humidity": hum,
+                    "chamber_hum": hum,
+                    "hum": hum,
+                    "battery_volt": b_volt,
+                    "bms_volt": b_volt,
+                    "volts": b_volt,
+                    "battery_current": b_curr,
+                    "bms_curr": b_curr,
+                    "amps": b_curr,
+                    "battery_power": b_power,
+                    "bms_power": b_power,
+                    "watts": b_power,
+                    "battery_temp": b_temp,
+                    "bms_temp": b_temp,
+                    "battery_soc": b_soc,
+                    "bms_soc": b_soc,
+                    "soc": b_soc,
+                    "bms_remaining_ah": round(15.0 * b_soc / 100.0, 2),
+                    "battery_soh": b_soh,
+                    "bms_soh": b_soh,
+                    "soh": b_soh,
+                    "pwm1": pwm1,
+                    "pwm_rc1": pwm1,
+                    "p1": pwm1,
+                    "t1": pwm1,
+                    "pwm2": pwm2,
+                    "pwm_rc2": pwm2,
+                    "p2": pwm2,
+                    "t2": pwm2,
+                    "pwm3": pwm3,
+                    "pwm_rc3": pwm3,
+                    "p3": pwm3,
+                    "t3": pwm3,
+                    "light_status": light,
+                    "light": light,
+                    "camera_status": camera,
+                    "camera": camera,
+                    "sonar_range": sonar_r,
+                    "distance": sonar_r if sonar_r is not None else 0.0,
+                    "sonar_bearing": sonar_b,
+                    "sonar_scan_angle": 0.0,
+                    "sonar_active": 1 if (sonar_r is not None or sonar_b is not None) else 0,
+                    "confidence": 100.0 if (sonar_r is not None or is_gps_connected) else 0.0,
+                    "magx": mx,
+                    "magX": mx,
+                    "mx": mx,
+                    "magy": my,
+                    "magY": my,
+                    "my": my,
+                    "magz": mz,
+                    "magZ": mz,
+                    "mz": mz,
+                    "magB": magB,
+                    "mag_total": magB,
+                    "rm3100_valid": 1 if rm3100_valid else 0,
+                    "gps_valid": gps_valid,
+                    "gps": "FIX" if is_gps_connected else "NO_FIX",
+                    "gps_status": "FIX" if is_gps_connected else "NO_FIX",
+                    "depth": 0.0,
+                    "wtemp": 0.0,
+                    "pressure": 0.0,
+                    "failsafe": 0,
+                    "mode": "Subsea 25-Field CSV"
+                }
+
+            # Check for the current 26-field Teensy format, with legacy 23-field support:
+            # TEMP,HUM,PWM1,PWM2,PWM3,LIGHT,CAMERA,FAILSAFE,VALID,CMD,GPS,LAT,LON,ALT,SAT,HDOP,SPEED,COURSE,UTC,MX,MY,MZ,MAG_TOTAL
+            if len(parts) in (23, 26) and (900 <= float(parts[2]) <= 2100):
+                temp = float(parts[0])
+                hum = float(parts[1])
+                pwm1 = int(float(parts[2]))
+                pwm2 = int(float(parts[3]))
+                pwm3 = int(float(parts[4]))
+                light = int(float(parts[5]))
+                camera = int(float(parts[6]))
+                fs = int(float(parts[7]))
+                valid = int(float(parts[8]))
+                cmds = int(float(parts[9]))
+                gps_str = str(parts[10]).strip()
+                lat = float(parts[11])
+                lon = float(parts[12])
+                alt = float(parts[13])
+                sats = int(float(parts[14]))
+                hdop = float(parts[15])
+                speed = float(parts[16])
+                course = float(parts[17])
+                utc_str = str(parts[18]).strip()
+                mx = float(parts[19])
+                my = float(parts[20])
+                mz = float(parts[21])
+                mag_total = float(parts[22])
+                # The current format appends AHRS roll, pitch and yaw after MAG_TOTAL.
+                # Legacy packets do not contain these values.
+                packet_attitude = len(parts) == 26
+                if packet_attitude:
+                    roll = float(parts[23])
+                    pitch = float(parts[24])
+                    yaw = float(parts[25])
+
+                # Validity checks:
+                rm3100_valid = True
+                if (valid & 4) == 0 or (mx == 0.0 and my == 0.0 and mz == 0.0 and mag_total == 0.0):
+                    rm3100_valid = False
+
+                gps_upper = gps_str.upper()
+                is_gps_connected = (("FIX" in gps_upper and "NO" not in gps_upper) or ((valid & 8) != 0)) and (abs(lat) > 0.0001 or abs(lon) > 0.0001)
+                gps_valid = 1 if is_gps_connected else 0
+
+                if not is_gps_connected:
+                    lat = 0.0
+                    lon = 0.0
+                    sats = 0
+                    gps_valid = 0
+
+                # Heading / attitude calculation
+                if not packet_attitude:
+                    if course > 0.0:
+                        yaw = course
+                    elif rm3100_valid and (mx != 0.0 or my != 0.0):
+                        yaw = round(math.degrees(math.atan2(-my, mx)) % 360.0, 2)
+                    else:
+                        yaw = getattr(self, 'sim_yaw', 0.0)
+
+                    roll = getattr(self, 'sim_roll', 0.0)
+                    pitch = getattr(self, 'sim_pitch', 0.0)
+
+                return {
+                    "raw_packet": line_str,
+                    "roll": roll,
+                    "pitch": pitch,
+                    "yaw": yaw,
+                    "latitude": lat,
+                    "longitude": lon,
+                    "satellites": sats,
+                    "sat": sats,
+                    "distance": 0.0,
+                    "confidence": 100.0 if is_gps_connected else 0.0,
+                    "mx": mx,
+                    "my": my,
+                    "mz": mz,
+                    "magX": mx,
+                    "magY": my,
+                    "magZ": mz,
+                    "magB": mag_total,
+                    "mag_total": mag_total,
+                    "rm3100_valid": 1 if rm3100_valid else 0,
+                    "gps": gps_str,
+                    "gps_status": gps_str,
+                    "gps_valid": gps_valid,
+                    "altitude": alt,
+                    "alt_m": alt,
+                    "alt": alt,
+                    "hdop": hdop,
+                    "speed": speed,
+                    "speed_kmph": speed,
+                    "course": course,
+                    "course_deg": course,
+                    "utc": utc_str,
+                    "time_utc": utc_str,
+                    "teensy_valid": valid,
+                    "valid": valid,
+                    "cmds": cmds,
+                    "cmd": cmds,
+                    "depth": 0.0,
+                    "wtemp": 0.0,
+                    "pressure": 0.0,
+                    "chamber_temp": temp,
+                    "chamber_hum": hum,
+                    "bms_volt": 16.8,
+                    "bms_curr": 0.0,
+                    "bms_power": 0.0,
+                    "bms_soc": 100,
+                    "bms_remaining_ah": 15.0,
+                    "bms_soh": 100,
+                    "bms_temp": temp,
+                    "pwm_rc1": pwm1,
+                    "pwm_rc2": pwm2,
+                    "pwm_rc3": pwm3,
+                    "light": light,
+                    "camera": camera,
+                    "failsafe": fs,
+                    "sonar_range": None,
+                    "sonar_bearing": None,
+                    "sonar_scan_angle": 0.0,
+                    "sonar_active": 0,
+                    "mode": "Teensy Telemetry"
+                }
+
+            # Check for Teensy 4.1 22-field continuous telemetry format:
+            # temp,hum,magX,magY,magZ,magB,pwm1,pwm2,pwm3,light,cam,fs,valid,cmds,lat,lon,alt_m,sats,hdop,speed_kmph,course_deg,gps_valid
+            elif len(parts) == 22 and (900 <= float(parts[6]) <= 2100):
+                temp = float(parts[0])
+                hum = float(parts[1])
+                magX = float(parts[2])
+                magY = float(parts[3])
+                magZ = float(parts[4])
+                magB = float(parts[5])
+                pwm1 = int(float(parts[6]))
+                pwm2 = int(float(parts[7]))
+                pwm3 = int(float(parts[8]))
+                light = int(float(parts[9]))
+                camera = int(float(parts[10]))
+                fs = int(float(parts[11]))
+                valid = int(float(parts[12]))
+                cmds = int(float(parts[13]))
+                lat = float(parts[14])
+                lon = float(parts[15])
+                alt_m = float(parts[16])
+                sats = int(float(parts[17]))
+                hdop = float(parts[18])
+                speed_kmph = float(parts[19])
+                course_deg = float(parts[20])
+                gps_valid = int(float(parts[21]))
+
+                # Sensor validity checks:
+                # 1. RM3100 health:
+                #    If RM3100 is not working: magX=0, magY=0, magZ=0, magB=0, and valid bit 2 (4) is 0 (valid=11)
+                rm3100_valid = True
+                if (valid & 4) == 0 or (magX == 0.0 and magY == 0.0 and magZ == 0.0 and magB == 0.0):
+                    rm3100_valid = False
+
+                # 2. GPS status:
+                #    If GPS is not connected: valid bit 3 (8) is 0 (valid=7), gps_valid=0, lat=0.0, lon=0.0, sats=0
+                is_gps_connected = (gps_valid == 1) and ((valid & 8) != 0) and (abs(lat) > 0.0001 or abs(lon) > 0.0001)
+
+                if not is_gps_connected:
+                    lat = 0.0
+                    lon = 0.0
+                    sats = 0
+                    gps_valid = 0
+
+                # Heading / attitude calculation
+                if course_deg > 0.0:
+                    yaw = course_deg
+                elif rm3100_valid and (magX != 0.0 or magY != 0.0):
+                    yaw = round(math.degrees(math.atan2(-magY, magX)) % 360.0, 2)
+                else:
+                    yaw = getattr(self, 'sim_yaw', 0.0)
+
+                roll = getattr(self, 'sim_roll', 0.0)
+                pitch = getattr(self, 'sim_pitch', 0.0)
+
+                return {
+                    "raw_packet": line_str,
+                    "roll": roll,
+                    "pitch": pitch,
+                    "yaw": yaw,
+                    "latitude": lat,
+                    "longitude": lon,
+                    "satellites": sats,
+                    "distance": 0.0,
+                    "confidence": 100.0 if is_gps_connected else 0.0,
+                    "mx": magX,
+                    "my": magY,
+                    "mz": magZ,
+                    "magX": magX,
+                    "magY": magY,
+                    "magZ": magZ,
+                    "magB": magB,
+                    "rm3100_valid": 1 if rm3100_valid else 0,
+                    "gps_valid": gps_valid,
+                    "altitude": alt_m,
+                    "alt_m": alt_m,
+                    "hdop": hdop,
+                    "speed_kmph": speed_kmph,
+                    "course_deg": course_deg,
+                    "teensy_valid": valid,
+                    "valid": valid,
+                    "cmds": cmds,
+                    "depth": 0.0,
+                    "wtemp": 0.0,
+                    "pressure": 0.0,
+                    "chamber_temp": temp,
+                    "chamber_hum": hum,
+                    "bms_volt": 16.8,
+                    "bms_curr": 0.0,
+                    "bms_power": 0.0,
+                    "bms_soc": 100,
+                    "bms_remaining_ah": 15.0,
+                    "bms_soh": 100,
+                    "bms_temp": temp,
+                    "pwm_rc1": pwm1,
+                    "pwm_rc2": pwm2,
+                    "pwm_rc3": pwm3,
+                    "light": light,
+                    "camera": camera,
+                    "failsafe": fs,
+                    "sonar_range": None,
+                    "sonar_bearing": None,
+                    "sonar_scan_angle": 0.0,
+                    "sonar_active": 0,
+                    "mode": "Teensy Telemetry"
+                }
+
+            elif len(parts) >= 15:
+                # Handle partially populated or extended telemetry packets safely with standard 25-field alignment
+                roll = _to_f(parts[0])
+                pitch = _to_f(parts[1])
+                yaw = _to_f(parts[2])
+                lat = _to_f(parts[3])
+                lon = _to_f(parts[4])
+                sats = _to_i(parts[5])
+                temp = _to_f(parts[6])
+                hum = _to_f(parts[7])
+                b_volt = _to_f(parts[8]) if len(parts) > 8 else 0.0
+                b_curr = _to_f(parts[9]) if len(parts) > 9 else 0.0
+                b_power = _to_f(parts[10]) if len(parts) > 10 else round(b_volt * b_curr, 2)
+                b_temp = _to_f(parts[11]) if len(parts) > 11 else 0.0
+                b_soc = _to_i(parts[12]) if len(parts) > 12 else 0
+                b_soh = _to_i(parts[13], 100) if len(parts) > 13 else 100
+                pwm1 = _to_i(parts[14], 1500) if len(parts) > 14 else 1500
+                pwm2 = _to_i(parts[15], 1500) if len(parts) > 15 else 1500
+                pwm3 = _to_i(parts[16], 1500) if len(parts) > 16 else 1500
+                light = _to_i(parts[17]) if len(parts) > 17 else 0
+                camera = _to_i(parts[18]) if len(parts) > 18 else 0
+                sonar_r = _to_opt_f(parts[19]) if len(parts) > 19 else None
+                sonar_b = _to_opt_f(parts[20]) if len(parts) > 20 else None
+                mx = _to_f(parts[21]) if len(parts) > 21 else 0.0
+                my = _to_f(parts[22]) if len(parts) > 22 else 0.0
+                mz = _to_f(parts[23]) if len(parts) > 23 else 0.0
+                magB = _to_f(parts[24]) if len(parts) > 24 else (round(math.sqrt(mx**2 + my**2 + mz**2), 3) if (mx or my or mz) else 0.0)
+
+                is_gps_connected = (abs(lat) > 0.0001 or abs(lon) > 0.0001) or (sats > 0)
+                gps_valid = 1 if is_gps_connected else 0
+
+                return {
+                    "raw_packet": line_str,
+                    "roll": roll,
+                    "pitch": pitch,
+                    "yaw": yaw,
+                    "heading": yaw,
+                    "latitude": lat,
+                    "lat": lat,
+                    "longitude": lon,
+                    "lon": lon,
+                    "satellites": sats,
+                    "sat": sats,
+                    "no_of_satellites": sats,
+                    "temperature": temp,
+                    "chamber_temp": temp,
+                    "temp": temp,
+                    "humidity": hum,
+                    "chamber_hum": hum,
+                    "hum": hum,
+                    "battery_volt": b_volt,
+                    "bms_volt": b_volt,
+                    "volts": b_volt,
+                    "battery_current": b_curr,
+                    "bms_curr": b_curr,
+                    "amps": b_curr,
+                    "battery_power": b_power,
+                    "bms_power": b_power,
+                    "watts": b_power,
+                    "battery_temp": b_temp,
+                    "bms_temp": b_temp,
+                    "battery_soc": b_soc,
+                    "bms_soc": b_soc,
+                    "soc": b_soc,
+                    "bms_remaining_ah": round(15.0 * b_soc / 100.0, 2),
+                    "battery_soh": b_soh,
+                    "bms_soh": b_soh,
+                    "soh": b_soh,
+                    "pwm1": pwm1,
+                    "pwm_rc1": pwm1,
+                    "p1": pwm1,
+                    "t1": pwm1,
+                    "pwm2": pwm2,
+                    "pwm_rc2": pwm2,
+                    "p2": pwm2,
+                    "t2": pwm2,
+                    "pwm3": pwm3,
+                    "pwm_rc3": pwm3,
+                    "p3": pwm3,
+                    "t3": pwm3,
+                    "light_status": light,
+                    "light": light,
+                    "camera_status": camera,
+                    "camera": camera,
+                    "sonar_range": sonar_r,
+                    "distance": sonar_r if sonar_r is not None else 0.0,
+                    "sonar_bearing": sonar_b,
+                    "sonar_scan_angle": 0.0,
+                    "sonar_active": 1 if (sonar_r is not None or sonar_b is not None) else 0,
+                    "confidence": 100.0 if (sonar_r is not None or is_gps_connected) else 0.0,
+                    "magx": mx,
+                    "magX": mx,
+                    "mx": mx,
+                    "magy": my,
+                    "magY": my,
+                    "my": my,
+                    "magz": mz,
+                    "magZ": mz,
+                    "mz": mz,
+                    "magB": magB,
+                    "mag_total": magB,
+                    "rm3100_valid": 1 if (mx != 0.0 or my != 0.0 or mz != 0.0 or magB != 0.0) else 0,
+                    "gps_valid": gps_valid,
+                    "gps": "FIX" if is_gps_connected else "NO_FIX",
+                    "gps_status": "FIX" if is_gps_connected else "NO_FIX",
+                    "depth": 0.0,
+                    "wtemp": 0.0,
+                    "pressure": 0.0,
+                    "failsafe": 0,
+                    "mode": "Subsea CSV"
+                }
+        except Exception:
+            pass
+
+        return None
+
+    def run_tcp_client(self):
+        import socket
+        
+        ip = "127.0.0.1"
+        port = 8888
+        
+        # Parse target IP:PORT from raw_target
+        if ":" in self.raw_target:
+            try:
+                parts = self.raw_target.split(":")
+                ip = parts[0].strip()
+                port = int(parts[1].strip())
+            except:
+                pass
+                
+        self.connection_status.emit(True, f"TCP Connecting...")
+        
+        while self.running:
+            try:
+                # Open TCP socket connection
+                self.socket_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                # Disable Nagle's algorithm for low-latency telemetry streaming
+                self.socket_conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.socket_conn.settimeout(2.0)
+                self.socket_conn.connect((ip, port))
+                self.socket_conn.settimeout(0.05)
+                self.connection_status.emit(True, f"TCP: {ip}")
+                
+                # Transmit heartbeat command at 1.0Hz
+                last_hb_tx = 0.0
+                buffer = b""
+                
+                while self.running:
+                    self._flush_tx_queue()
+                    now = time.time()
+                    if now - last_hb_tx >= 1.0:
+                        self.send_heartbeat()
+                        last_hb_tx = now
+                        
+                    try:
+                        data = self.socket_conn.recv(4096)
+                    except socket.timeout:
+                        continue
+                        
+                    if not data:
+                        break # connection closed
+                        
+                    buffer += data
+                    
+                    # Split packets by newline and emit every telemetry packet.
+                    while b"\n" in buffer:
+                        line_bytes, buffer = buffer.split(b"\n", 1)
+                        line = line_bytes.decode('utf-8', errors='ignore').strip()
+                        if line:
+                            self.raw_line_received.emit(line)
+                            # Handle control acknowledgements/logs immediately.
+                            if self._handle_special_line(line):
+                                continue
+                            
+                            parsed_data = self.parse_data(line)
+                            if parsed_data:
+                                parsed_data["mode"] = "TCP Link"
+                                self.data_received.emit(parsed_data)
+                                
+            except Exception as e:
+                self.connection_status.emit(False, "TCP Offline")
+                if self.socket_conn:
+                    try:
+                        self.socket_conn.close()
+                    except:
+                        pass
+                    self.socket_conn = None
+                time.sleep(1.0) # wait before retry
+
+    def run_udp_client(self):
+        import socket
+        
+        target_ip = "127.0.0.1"
+        target_port = 8888
+        
+        # Parse target IP:PORT from raw_target input
+        raw = self.raw_target.strip()
+        if ":" in raw:
+            try:
+                parts = raw.split(":")
+                target_ip = parts[0].strip()
+                target_port = int(parts[1].strip())
+            except Exception:
+                pass
+        elif raw.isdigit():
+            target_port = int(raw)
+        elif raw:
+            target_ip = raw
+                
+        self.udp_send_addr = (target_ip, target_port)
+        self.connection_status.emit(True, f"UDP Listening: {target_port}")
+        
+        while self.running:
+            try:
+                # Open UDP client socket with broadcast and reuseaddr enabled
+                self.socket_conn = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.socket_conn.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.socket_conn.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                self.socket_conn.settimeout(0.5)
+                
+                # Disable WSAECONNRESET on Windows
+                import os
+                if os.name == 'nt':
+                    try:
+                        self.socket_conn.ioctl(socket.SIO_UDP_CONNRESET, False)
+                    except Exception:
+                        pass
+                
+                # Bind directly to local port to receive incoming broadcast or unicast packets
+                try:
+                    self.socket_conn.bind(('0.0.0.0', target_port))
+                except Exception:
+                    # If port is already bound locally, bind to wildcard ephemeral port
+                    try:
+                        self.socket_conn.bind(('0.0.0.0', 0))
+                    except Exception:
+                        pass
+                
+                last_hb_tx = 0.0
+                connected_announced = False
+                
+                while self.running:
+                    self._flush_tx_queue()
+                    now = time.time()
+                    if now - last_hb_tx >= 1.0:
+                        self.send_heartbeat()
+                        last_hb_tx = now
+                        
+                    self.socket_conn.settimeout(0.1)
+                    while self.running:
+                        try:
+                            data, addr = self.socket_conn.recvfrom(65535)
+                            if data:
+                                # Automatically adapt reply address to whoever is broadcasting telemetry
+                                self.udp_send_addr = addr
+                                if not connected_announced:
+                                    self.connection_status.emit(True, f"UDP: {addr[0]}")
+                                    connected_announced = True
+                                for line in data.decode('utf-8', errors='ignore').splitlines():
+                                    line = line.strip()
+                                    if not line:
+                                        continue
+                                    self.raw_line_received.emit(line)
+                                    if self._handle_special_line(line):
+                                        continue
+
+                                    parsed_data = self.parse_data(line)
+                                    if parsed_data:
+                                        parsed_data["mode"] = "UDP Link"
+                                        self.data_received.emit(parsed_data)
+                        except (socket.timeout, OSError):
+                            break
+                                
+            except Exception as e:
+                self.connection_status.emit(False, "UDP Error")
+                if self.socket_conn:
+                    try:
+                        self.socket_conn.close()
+                    except Exception:
+                        pass
+                    self.socket_conn = None
+                time.sleep(1.0)
+
+    def stop(self):
+        self.running = False
+        self._clear_tx_queue()
+        if self.socket_conn:
+            try:
+                self.socket_conn.close()
+            except:
+                pass
+            self.socket_conn = None
+        self.wait()

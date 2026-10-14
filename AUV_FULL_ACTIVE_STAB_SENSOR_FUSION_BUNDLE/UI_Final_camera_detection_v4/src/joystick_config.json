@@ -1,0 +1,52 @@
+{
+    "axes": {
+        "rc1": {
+            "axis": 1,
+            "reverse": true
+        },
+        "rc2": {
+            "axis": 0,
+            "reverse": false
+        },
+        "rc3": {
+            "axis": 4,
+            "reverse": true
+        }
+    },
+    "buttons": {
+        "arm": {
+            "button": 2
+        },
+        "disarm": {
+            "button": 3
+        },
+        "start": {
+            "button": null
+        },
+        "stop": {
+            "button": null
+        },
+        "rth": {
+            "button": null
+        },
+        "light": {
+            "button": null
+        },
+        "camera": {
+            "button": null
+        },
+        "manual_mode": {
+            "button": 4
+        },
+        "auto_mode": {
+            "button": 5
+        },
+        "dock": {
+            "button": null
+        }
+    },
+    "thruster_limits": {
+        "min": 1430,
+        "max": 1570
+    }
+}

@@ -1,0 +1,7 @@
+# Extra packages for the Camera Detection page
+# (install into the same Python environment you use to run main.py)
+ultralytics>=8.3
+opencv-python>=4.8
+
+# Required by Sensor Fusion Kalman filter and camera geometry
+numpy>=1.24

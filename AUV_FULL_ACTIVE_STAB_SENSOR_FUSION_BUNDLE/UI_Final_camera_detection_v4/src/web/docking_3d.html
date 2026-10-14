@@ -1,0 +1,667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Realistic 3D Tactical Docking Environment</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        body, html {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #060e1a;
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+            color: #ffffff;
+        }
+        #webgl-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+        /* Tactical HUD Card */
+        #hud-card {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 340px;
+            background: rgba(10, 18, 30, 0.88);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border: 1px solid rgba(0, 229, 255, 0.25);
+            border-radius: 8px;
+            padding: 14px 16px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+            pointer-events: none;
+            z-index: 10;
+        }
+        .hud-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .hud-accent {
+            width: 3px;
+            height: 15px;
+            background: #00E5FF;
+            border-radius: 2px;
+            box-shadow: 0 0 8px #00E5FF;
+        }
+        .hud-title {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.8px;
+            color: #ffffff;
+            text-transform: uppercase;
+        }
+        .hud-row {
+            font-family: 'Consolas', monospace;
+            font-size: 10px;
+            color: #94A3B8;
+            margin-top: 3px;
+        }
+        .hud-metrics {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 10px;
+            padding-top: 8px;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .metric-val {
+            font-size: 12px;
+            font-weight: 700;
+        }
+        .metric-cyan { color: #00E5FF; }
+        .metric-white { color: #FFFFFF; }
+        .metric-status {
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 700;
+            background: rgba(0, 229, 255, 0.15);
+            color: #00E5FF;
+            border: 1px solid rgba(0, 229, 255, 0.4);
+        }
+        /* Camera Quick Presets Floating Bar */
+        #cam-bar {
+            position: absolute;
+            bottom: 22px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 8px;
+            background: rgba(10, 18, 30, 0.85);
+            backdrop-filter: blur(8px);
+            -webkit-backdrop-filter: blur(8px);
+            border: 1px solid rgba(51, 65, 85, 0.7);
+            border-radius: 8px;
+            padding: 6px 10px;
+            z-index: 10;
+        }
+        .cam-btn {
+            background: #0F172A;
+            color: #94A3B8;
+            border: 1px solid #334155;
+            border-radius: 5px;
+            padding: 6px 14px;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .cam-btn:hover {
+            background: #1E293B;
+            color: #00E5FF;
+            border-color: #0284C7;
+        }
+        .cam-btn.active {
+            background: linear-gradient(180deg, #0284C7, #0369A1);
+            color: #FFFFFF;
+            border-color: #00E5FF;
+            box-shadow: 0 0 10px rgba(0, 229, 255, 0.4);
+        }
+        /* Navigation Hint */
+        #controls-hint {
+            position: absolute;
+            bottom: 24px;
+            right: 22px;
+            background: rgba(10, 18, 30, 0.75);
+            border: 1px solid rgba(51, 65, 85, 0.5);
+            border-radius: 6px;
+            padding: 6px 12px;
+            font-size: 10px;
+            color: #64748B;
+            pointer-events: none;
+            z-index: 10;
+        }
+    </style>
+    <!-- Offline Three.js Bundles -->
+    <script src="lib/three.min.js"></script>
+    <script src="lib/OrbitControls.js"></script>
+    <script src="lib/GLTFLoader.js"></script>
+    <script src="lib/OBJLoader.js"></script>
+</head>
+<body>
+    <canvas id="webgl-canvas"></canvas>
+
+    <!-- Tactical Telemetry Overlay -->
+    <div id="hud-card">
+        <div class="hud-header">
+            <div class="hud-accent"></div>
+            <div class="hud-title">3D TACTICAL DOCKING ENVIRONMENT</div>
+        </div>
+        <div class="hud-row" id="hud-station">STATION: 13.082700°, 80.270700°</div>
+        <div class="hud-row" id="hud-auv">AUV GPS: 13.082700°, 80.270815°</div>
+        <div class="hud-row" id="hud-depth">DEPTH: 0.00 m | YAW: 270.0° | PITCH: 0.0°</div>
+        <div class="hud-metrics">
+            <span class="metric-val metric-cyan" id="hud-range">RANGE: 12.50 m</span>
+            <span class="metric-val metric-white" id="hud-align">ALIGN: +0.00 m</span>
+            <span class="metric-status" id="hud-status">APPROACH</span>
+        </div>
+    </div>
+
+    <!-- 3D Camera Controls Presets -->
+    <div id="cam-bar">
+        <button class="cam-btn active" id="btn-50m" onclick="setCameraPreset('50m')">50m SONAR</button>
+        <button class="cam-btn" id="btn-10m" onclick="setCameraPreset('10m')">10m CAM</button>
+        <button class="cam-btn" id="btn-3m" onclick="setCameraPreset('3m')">3m DOCK</button>
+        <button class="cam-btn" id="btn-chase" onclick="setCameraPreset('chase')">CHASE CAM</button>
+        <button class="cam-btn" id="btn-reset" onclick="setCameraPreset('reset')">RESET</button>
+    </div>
+
+    <div id="controls-hint">Orbit: Left Click | Pan: Right Click | Zoom: Scroll</div>
+
+    <script>
+        // --- 1. Scene, Camera, Renderer Setup ---
+        const canvas = document.getElementById('webgl-canvas');
+        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x061426);
+        scene.fog = new THREE.FogExp2(0x07223b, 0.012);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 500);
+        camera.position.set(22, 14, 26);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.06;
+        controls.maxDistance = 180;
+        controls.minDistance = 0.8;
+        controls.target.set(0, 0, 0);
+
+        // --- 2. Lighting & Atmosphere ---
+        const ambientLight = new THREE.AmbientLight(0x4a7c9f, 0.85);
+        scene.add(ambientLight);
+
+        const sunLight = new THREE.DirectionalLight(0xfff6dd, 1.4);
+        sunLight.position.set(40, 60, 30);
+        sunLight.castShadow = true;
+        sunLight.shadow.mapSize.width = 2048;
+        sunLight.shadow.mapSize.height = 2048;
+        sunLight.shadow.camera.near = 10;
+        sunLight.shadow.camera.far = 150;
+        sunLight.shadow.camera.left = -40;
+        sunLight.shadow.camera.right = 40;
+        sunLight.shadow.camera.top = 40;
+        sunLight.shadow.camera.bottom = -40;
+        scene.add(sunLight);
+
+        const underWaterLight = new THREE.DirectionalLight(0x00e5ff, 0.65);
+        underWaterLight.position.set(-20, -30, -20);
+        scene.add(underWaterLight);
+
+        // --- 3. Realistic Water Surface & Seafloor ---
+        // Semi-transparent animated water surface at Y = 0
+        const waterGeo = new THREE.PlaneGeometry(160, 160, 48, 48);
+        const waterMat = new THREE.MeshStandardMaterial({
+            color: 0x0c4a6e,
+            roughness: 0.15,
+            metalness: 0.45,
+            transparent: true,
+            opacity: 0.65,
+            side: THREE.DoubleSide
+        });
+        const waterMesh = new THREE.Mesh(waterGeo, waterMat);
+        waterMesh.rotation.x = -Math.PI / 2;
+        waterMesh.position.y = 0;
+        scene.add(waterMesh);
+
+        // Seafloor sandy bottom at Y = -22m
+        const seafloorGeo = new THREE.PlaneGeometry(180, 180, 24, 24);
+        const seafloorMat = new THREE.MeshStandardMaterial({
+            color: 0x051b2e,
+            roughness: 0.85,
+            metalness: 0.1
+        });
+        const seafloor = new THREE.Mesh(seafloorGeo, seafloorMat);
+        seafloor.rotation.x = -Math.PI / 2;
+        seafloor.position.y = -22;
+        seafloor.receiveShadow = true;
+        scene.add(seafloor);
+
+        // Coordinate Grid along Seafloor
+        const gridHelper = new THREE.GridHelper(120, 24, 0x00e5ff, 0x133854);
+        gridHelper.position.y = -21.9;
+        scene.add(gridHelper);
+
+        // --- 4. Docking Station Procedural 3D Model (Length: 1.90 m = 1900 mm) ---
+        // Funnel mouth at (0, 0, 0) facing +X. Body extends to -X.
+        const dockGroup = new THREE.Group();
+
+        // Materials
+        const metalTrussMat = new THREE.MeshStandardMaterial({ color: 0x94a3b8, metalness: 0.85, roughness: 0.25 });
+        const funnelMat = new THREE.MeshStandardMaterial({ color: 0xf1f5f9, metalness: 0.65, roughness: 0.35, side: THREE.DoubleSide });
+        const blackTrimMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, roughness: 0.5 });
+        const whiteHullMat = new THREE.MeshStandardMaterial({ color: 0xf8fafc, roughness: 0.3 });
+        const greenBatteryMat = new THREE.MeshStandardMaterial({ color: 0x16a34a, roughness: 0.4, metalness: 0.3 });
+        const emitterMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff });
+
+        // 1. Entrance Funnel Cone (facing +X)
+        // Length = 0.65m, radius opens from 0.22m to 0.55m
+        const funnelGeo = new THREE.CylinderGeometry(0.55, 0.22, 0.65, 32, 1, true);
+        const funnelMesh = new THREE.Mesh(funnelGeo, funnelMat);
+        funnelMesh.rotation.z = Math.PI / 2;
+        funnelMesh.position.x = -0.325; // mouth at X=0
+        dockGroup.add(funnelMesh);
+
+        // Funnel collar ring at mouth (X = 0)
+        const collarGeo = new THREE.TorusGeometry(0.56, 0.035, 16, 32);
+        const collarMesh = new THREE.Mesh(collarGeo, metalTrussMat);
+        collarMesh.rotation.y = Math.PI / 2;
+        collarMesh.position.x = 0;
+        dockGroup.add(collarMesh);
+
+        // Latch Emitter Ring (Glowing blue induction coil inside latch)
+        const latchEmitterGeo = new THREE.TorusGeometry(0.24, 0.025, 16, 32);
+        const latchEmitterMesh = new THREE.Mesh(latchEmitterGeo, emitterMat);
+        latchEmitterMesh.rotation.y = Math.PI / 2;
+        latchEmitterMesh.position.x = -0.65;
+        dockGroup.add(latchEmitterMesh);
+
+        // 2. Truss Structural Cage (Aluminum square collar and struts)
+        const cageGeo = new THREE.BoxGeometry(0.40, 0.72, 0.72);
+        const cageWire = new THREE.WireframeGeometry(cageGeo);
+        const cageLine = new THREE.LineSegments(cageWire, new THREE.LineBasicMaterial({ color: 0x64748b, linewidth: 2 }));
+        cageLine.position.x = -0.85;
+        dockGroup.add(cageLine);
+
+        // 3. Central Electronics & Battery Enclosure with cooling fins (Green Section)
+        const batteryGeo = new THREE.BoxGeometry(0.35, 0.45, 0.48);
+        const batteryMesh = new THREE.Mesh(batteryGeo, greenBatteryMat);
+        batteryMesh.position.x = -1.15;
+        dockGroup.add(batteryMesh);
+
+        // Cooling Fin ribs
+        for (let i = -0.14; i <= 0.14; i += 0.07) {
+            const finGeo = new THREE.BoxGeometry(0.015, 0.48, 0.51);
+            const finMesh = new THREE.Mesh(finGeo, blackTrimMat);
+            finMesh.position.set(-1.15 + i, 0, 0);
+            dockGroup.add(finMesh);
+        }
+
+        // 4. Rear Bullet Fuselage (White aerodynamic tail capsule)
+        // Length 0.60m, diameter 0.38m
+        const bulletGeo = new THREE.CylinderGeometry(0.20, 0.19, 0.45, 24);
+        const bulletMesh = new THREE.Mesh(bulletGeo, whiteHullMat);
+        bulletMesh.rotation.z = Math.PI / 2;
+        bulletMesh.position.x = -1.55;
+        dockGroup.add(bulletMesh);
+
+        // Tail hemisphere cap
+        const capGeo = new THREE.SphereGeometry(0.19, 24, 16, 0, Math.PI * 2, 0, Math.PI / 2);
+        const capMesh = new THREE.Mesh(capGeo, whiteHullMat);
+        capMesh.rotation.z = -Math.PI / 2;
+        capMesh.position.x = -1.775;
+        dockGroup.add(capMesh);
+
+        // Rear probe connector tip (reaches X = -1.90m)
+        const probeGeo = new THREE.CylinderGeometry(0.04, 0.05, 0.125, 12);
+        const probeMesh = new THREE.Mesh(probeGeo, blackTrimMat);
+        probeMesh.rotation.z = Math.PI / 2;
+        probeMesh.position.x = -1.84;
+        dockGroup.add(probeMesh);
+
+        scene.add(dockGroup);
+
+        // --- 5. TS100 AUV Procedural 3D Model (Length: 1.90 m = 1900 mm) ---
+        const auvGroup = new THREE.Group();
+
+        const yellowHullMat = new THREE.MeshStandardMaterial({ color: 0xfacc15, roughness: 0.25, metalness: 0.15 });
+        const noseMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.4 });
+        const finMat = new THREE.MeshStandardMaterial({ color: 0x0f172a, roughness: 0.35 });
+        const glassMat = new THREE.MeshStandardMaterial({ color: 0x38bdf8, roughness: 0.1, metalness: 0.9, transparent: true, opacity: 0.8 });
+
+        // Streamlined Torpedo Hull (Cylinder)
+        // Diameter = 0.26m, length = 1.35m
+        const hullGeo = new THREE.CylinderGeometry(0.13, 0.13, 1.35, 24);
+        const hullMesh = new THREE.Mesh(hullGeo, yellowHullMat);
+        hullMesh.rotation.z = Math.PI / 2;
+        hullMesh.position.x = 0.725;
+        auvGroup.add(hullMesh);
+
+        // Nose Cone (Black optical sensor head, nose tip at local X = 0)
+        const noseGeo = new THREE.ConeGeometry(0.13, 0.30, 24);
+        const noseMesh = new THREE.Mesh(noseGeo, noseMat);
+        noseMesh.rotation.z = Math.PI / 2;
+        noseMesh.position.x = 0.15;
+        auvGroup.add(noseMesh);
+
+        // Optical Camera Window Port
+        const cameraPortGeo = new THREE.SphereGeometry(0.05, 16, 16);
+        const cameraPortMesh = new THREE.Mesh(cameraPortGeo, glassMat);
+        cameraPortMesh.position.x = 0.02;
+        auvGroup.add(cameraPortMesh);
+
+        // Tail Cone
+        const tailGeo = new THREE.ConeGeometry(0.13, 0.25, 24);
+        const tailMesh = new THREE.Mesh(tailGeo, yellowHullMat);
+        tailMesh.rotation.z = -Math.PI / 2;
+        tailMesh.position.x = 1.525;
+        auvGroup.add(tailMesh);
+
+        // Stabilizing Cruciform Fins (4 rudders/elevators at stern)
+        for (let i = 0; i < 4; i++) {
+            const finShape = new THREE.BoxGeometry(0.14, 0.18, 0.015);
+            const fin = new THREE.Mesh(finShape, finMat);
+            fin.position.x = 1.50;
+            fin.rotation.x = (i * Math.PI) / 2;
+            fin.translateY(0.14);
+            auvGroup.add(fin);
+        }
+
+        // Propeller Shroud & Hub
+        const shroudGeo = new THREE.CylinderGeometry(0.08, 0.08, 0.06, 16, 1, true);
+        const shroudMesh = new THREE.Mesh(shroudGeo, blackTrimMat);
+        shroudMesh.rotation.z = Math.PI / 2;
+        shroudMesh.position.x = 1.68;
+        auvGroup.add(shroudMesh);
+
+        // Initial AUV position (12.5m east of docking station)
+        auvGroup.position.set(12.5, 0, 0);
+        scene.add(auvGroup);
+
+        // --- 6. Tactical 3D Range Zones (3m, 10m, 50m) ---
+        // 1. 3.0 m Magnetic Field Surrounding Sphere
+        const emSphereGeo = new THREE.SphereGeometry(3.0, 32, 24);
+        const emSphereMat = new THREE.MeshBasicMaterial({
+            color: 0x00e5ff,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.25
+        });
+        const emSphere = new THREE.Mesh(emSphereGeo, emSphereMat);
+        scene.add(emSphere);
+
+        // Concentric wave pulse rings (3 concentric rings radiating outward up to 3m)
+        const waveRings = [];
+        for (let i = 0; i < 4; i++) {
+            const rGeo = new THREE.RingGeometry(0.1, 0.15, 48);
+            const rMat = new THREE.MeshBasicMaterial({
+                color: 0x00e5ff,
+                transparent: true,
+                opacity: 0.6,
+                side: THREE.DoubleSide
+            });
+            const rMesh = new THREE.Mesh(rGeo, rMat);
+            rMesh.rotation.x = Math.PI / 2;
+            scene.add(rMesh);
+            waveRings.push(rMesh);
+        }
+
+        // 2. 10.0 m Camera Range Wireframe Sphere
+        const camSphereGeo = new THREE.SphereGeometry(10.0, 32, 24);
+        const camSphereMat = new THREE.MeshBasicMaterial({
+            color: 0x38bdf8,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.18
+        });
+        const camSphere = new THREE.Mesh(camSphereGeo, camSphereMat);
+        scene.add(camSphere);
+
+        // 3. 50.0 m Sonar Range Hemisphere / Circle
+        const sonarDomeGeo = new THREE.SphereGeometry(50.0, 48, 24, 0, Math.PI * 2, 0, Math.PI / 2);
+        const sonarDomeMat = new THREE.MeshBasicMaterial({
+            color: 0x10b981,
+            wireframe: true,
+            transparent: true,
+            opacity: 0.12
+        });
+        const sonarDome = new THREE.Mesh(sonarDomeGeo, sonarDomeMat);
+        sonarDome.rotation.x = Math.PI; // underwater hemisphere
+        scene.add(sonarDome);
+
+        // Water surface range rings (20m, 30m, 40m, 50m)
+        const rangeRingsGroup = new THREE.Group();
+        [20, 30, 40, 50].forEach(r => {
+            const ringGeo = new THREE.RingGeometry(r - 0.08, r + 0.08, 64);
+            const ringMat = new THREE.MeshBasicMaterial({
+                color: r === 50 ? 0x10b981 : 0x0e7490,
+                transparent: true,
+                opacity: r === 50 ? 0.45 : 0.20,
+                side: THREE.DoubleSide
+            });
+            const ringMesh = new THREE.Mesh(ringGeo, ringMat);
+            ringMesh.rotation.x = Math.PI / 2;
+            ringMesh.position.y = -0.05;
+            rangeRingsGroup.add(ringMesh);
+        });
+        scene.add(rangeRingsGroup);
+
+        // 4. Dynamic 3D Alignment Vector (Dashed Line)
+        const lineMat = new THREE.LineDashedMaterial({
+            color: 0x00e5ff,
+            dashSize: 0.4,
+            gapSize: 0.25,
+            linewidth: 2
+        });
+        const lineGeo = new THREE.BufferGeometry().setFromPoints([
+            new THREE.Vector3(0, 0, 0),
+            new THREE.Vector3(12.5, 0, 0)
+        ]);
+        const alignmentLine = new THREE.Line(lineGeo, lineMat);
+        alignmentLine.computeLineDistances();
+        scene.add(alignmentLine);
+
+        // --- 7. Telemetry State & Update API ---
+        let currentMode = '50m';
+        let isChaseCam = false;
+        let globalPhase = 0;
+
+        window.telemetry = {
+            station_lat: 13.082700,
+            station_lon: 80.270700,
+            auv_lat: 13.082700,
+            auv_lon: 80.270815,
+            depth: 0.0,
+            heading: 270.0,
+            pitch: 0.0,
+            roll: 0.0,
+            distance: 12.50,
+            lat_offset: 0.0
+        };
+
+        window.updateTelemetry = function(lat, lon, depth, heading, pitch, roll, distance, station_lat, station_lon) {
+            if (lat !== undefined) window.telemetry.auv_lat = parseFloat(lat);
+            if (lon !== undefined) window.telemetry.auv_lon = parseFloat(lon);
+            if (depth !== undefined) window.telemetry.depth = parseFloat(depth);
+            if (heading !== undefined) window.telemetry.heading = parseFloat(heading);
+            if (pitch !== undefined) window.telemetry.pitch = parseFloat(pitch);
+            if (roll !== undefined) window.telemetry.roll = parseFloat(roll);
+            if (station_lat !== undefined) window.telemetry.station_lat = parseFloat(station_lat);
+            if (station_lon !== undefined) window.telemetry.station_lon = parseFloat(station_lon);
+
+            // Compute real-world relative displacement in meters
+            const lat_mid = (window.telemetry.station_lat + window.telemetry.auv_lat) / 2.0;
+            const d_north = (window.telemetry.auv_lat - window.telemetry.station_lat) * 111319.9;
+            const d_east = (window.telemetry.auv_lon - window.telemetry.station_lon) * 111319.9 * Math.cos(lat_mid * Math.PI / 180.0);
+            
+            const dist = Math.hypot(d_north, d_east);
+            window.telemetry.distance = dist;
+            window.telemetry.lat_offset = d_north;
+
+            // Update AUV 3D Position
+            // +X is East, +Z is South (or North), -Y is Depth
+            auvGroup.position.set(d_east, -window.telemetry.depth, -d_north);
+
+            // Update AUV 3D Orientation (Heading / Pitch / Roll)
+            // 270 deg = facing West towards station mouth (-X).
+            const yawRad = ((270.0 - window.telemetry.heading) * Math.PI) / 180.0;
+            const pitchRad = (window.telemetry.pitch * Math.PI) / 180.0;
+            const rollRad = (window.telemetry.roll * Math.PI) / 180.0;
+            auvGroup.rotation.set(rollRad, yawRad, pitchRad, 'YXZ');
+
+            // Update Alignment Vector
+            const points = [
+                new THREE.Vector3(0, 0, 0),
+                new THREE.Vector3(d_east, -window.telemetry.depth, -d_north)
+            ];
+            alignmentLine.geometry.setFromPoints(points);
+            alignmentLine.computeLineDistances();
+
+            // Update HUD elements
+            document.getElementById('hud-station').innerText = `STATION: ${window.telemetry.station_lat.toFixed(7)}°, ${window.telemetry.station_lon.toFixed(7)}°`;
+            document.getElementById('hud-auv').innerText = `AUV GPS: ${window.telemetry.auv_lat.toFixed(7)}°, ${window.telemetry.auv_lon.toFixed(7)}°`;
+            document.getElementById('hud-depth').innerText = `DEPTH: ${window.telemetry.depth.toFixed(2)} m | YAW: ${window.telemetry.heading.toFixed(1)}° | PITCH: ${window.telemetry.pitch.toFixed(1)}°`;
+            document.getElementById('hud-range').innerText = `RANGE: ${dist.toFixed(2)} m`;
+            document.getElementById('hud-align').innerText = `ALIGN: ${d_north >= 0 ? '+' : ''}${d_north.toFixed(2)} m`;
+
+            const statusEl = document.getElementById('hud-status');
+            if (dist < 0.5) {
+                statusEl.innerText = 'LOCKED';
+                statusEl.style.borderColor = '#10B981';
+                statusEl.style.color = '#10B981';
+                emSphereMat.color.setHex(0x10b981);
+            } else if (dist <= 3.0) {
+                statusEl.innerText = 'EM GUIDED';
+                statusEl.style.borderColor = '#00FFD2';
+                statusEl.style.color = '#00FFD2';
+                emSphereMat.color.setHex(0x00ffd2);
+            } else if (dist < 15.0) {
+                statusEl.innerText = 'APPROACH';
+                statusEl.style.borderColor = '#00E5FF';
+                statusEl.style.color = '#00E5FF';
+                emSphereMat.color.setHex(0x00e5ff);
+            } else {
+                statusEl.innerText = 'TRACKING';
+                statusEl.style.borderColor = '#64748B';
+                statusEl.style.color = '#94A3B8';
+                emSphereMat.color.setHex(0x00e5ff);
+            }
+        };
+
+        // --- 8. Camera Preset Navigation ---
+        window.setCameraPreset = function(preset) {
+            currentMode = preset;
+            document.querySelectorAll('.cam-btn').forEach(b => b.classList.remove('active'));
+
+            if (preset === '50m') {
+                document.getElementById('btn-50m').classList.add('active');
+                isChaseCam = false;
+                controls.target.set(12, 0, 0);
+                gsapFlyTo(42, 28, 48, 12, 0, 0);
+            } else if (preset === '10m') {
+                document.getElementById('btn-10m').classList.add('active');
+                isChaseCam = false;
+                controls.target.set(5, 0, 0);
+                gsapFlyTo(14, 8, 12, 5, 0, 0);
+            } else if (preset === '3m') {
+                document.getElementById('btn-3m').classList.add('active');
+                isChaseCam = false;
+                controls.target.set(0.5, 0, 0);
+                gsapFlyTo(4.5, 2.2, 4.0, 0, 0, 0);
+            } else if (preset === 'chase') {
+                document.getElementById('btn-chase').classList.add('active');
+                isChaseCam = true;
+            } else if (preset === 'reset') {
+                document.getElementById('btn-50m').classList.add('active');
+                isChaseCam = false;
+                controls.target.set(0, 0, 0);
+                camera.position.set(22, 14, 26);
+            }
+        };
+
+        function gsapFlyTo(tx, ty, tz, lx, ly, lz) {
+            const startPos = camera.position.clone();
+            const endPos = new THREE.Vector3(tx, ty, tz);
+            const startTarget = controls.target.clone();
+            const endTarget = new THREE.Vector3(lx, ly, lz);
+            let p = 0;
+            const step = () => {
+                p += 0.05;
+                if (p <= 1.0) {
+                    camera.position.lerpVectors(startPos, endPos, p);
+                    controls.target.lerpVectors(startTarget, endTarget, p);
+                    requestAnimationFrame(step);
+                }
+            };
+            step();
+        }
+
+        // --- 9. Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            globalPhase += 0.016;
+
+            // Slow EM Wave concentric emission (up to 3m)
+            const speed = 0.25;
+            for (let i = 0; i < waveRings.length; i++) {
+                const prog = (globalPhase * speed + i / waveRings.length) % 1.0;
+                const r = Math.max(0.1, prog * 3.0);
+                waveRings[i].scale.set(r * 6.5, r * 6.5, 1);
+                waveRings[i].material.opacity = Math.pow(1.0 - prog, 1.25) * 0.55;
+            }
+
+            // Gentle water ripple undulating surface
+            const pos = waterGeo.attributes.position;
+            for (let i = 0; i < pos.count; i++) {
+                const u = pos.getX(i);
+                const v = pos.getY(i);
+                const z = Math.sin(u * 0.12 + globalPhase * 1.2) * 0.18 + Math.cos(v * 0.14 + globalPhase * 0.9) * 0.14;
+                pos.setZ(i, z);
+            }
+            waterGeo.computeVertexNormals();
+            waterGeo.attributes.position.needsUpdate = true;
+
+            // Chase Cam tracking behind AUV
+            if (isChaseCam) {
+                const auvPos = auvGroup.position;
+                const forward = new THREE.Vector3(-1, 0, 0).applyQuaternion(auvGroup.quaternion);
+                const camDesired = auvPos.clone().sub(forward.multiplyScalar(4.5)).add(new THREE.Vector3(0, 1.8, 0));
+                camera.position.lerp(camDesired, 0.08);
+                controls.target.lerp(auvPos, 0.08);
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Initialize default view
+        setCameraPreset('50m');
+        animate();
+    </script>
+</body>
+</html>
